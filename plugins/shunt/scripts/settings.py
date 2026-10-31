@@ -1,5 +1,7 @@
 """Shared private JSON settings and atomic cross-process failover state."""
 import json
+import hashlib
+import errno
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -18,6 +20,7 @@ FIELDS = {
     "api_base": str, "model": str, "api_key": str,
     "context_tokens": int, "input_tokens": int, "reply_tokens": int,
     "max_payload_bytes": int, "chunk_summary_tokens": int, "timeout_seconds": (int, float), "min_lines": int,
+    "max_concurrency": int,
     "models": list, "current_model": int,
     "first_failure_at": (str, type(None)), "second_failure_at": (str, type(None)),
 }
@@ -78,6 +81,8 @@ def load_config():
                     raise ValueError
             except ValueError as exc:
                 raise ConfigError(f"{name} must be an ISO 8601 timestamp with timezone or null") from exc
+    if not 1 <= data.get("max_concurrency", 5) <= 100:
+        raise ConfigError("max_concurrency must be between 1 and 100")
     index = data.get("current_model", 0)
     if index < 0 or index >= len(data.get("models", [None])):
         raise ConfigError("current_model is outside the configured models")
@@ -105,7 +110,7 @@ def paused(config):
 
 @contextmanager
 def config_lock():
-    # Keep the lock for a complete failover cycle; never race on the pointer or timestamps.
+    # Only protect state transitions; provider HTTP calls must not hold this lock.
     lock_path = CONFIG_PATH.with_suffix(".lock")
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -154,3 +159,60 @@ def update_state(**changes):
         if temp is not None:
             temp.unlink(missing_ok=True)
         load_config.cache_clear()
+
+
+def acquire_slot(name, limit):
+    """Non-blocking per-provider cross-process lease; released even if the process crashes."""
+    provider = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+    for index in range(limit):
+        path = CONFIG_PATH.parent / f".shunt-active-{provider}-{index}.lock"
+        fd = None
+        acquired = False
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            details = os.fstat(fd)
+            if os.name == "nt" and details.st_size == 0:
+                os.write(fd, b"\0")  # Windows byte-range locks need an addressable byte.
+            if not stat.S_ISREG(details.st_mode) or (os.name != "nt" and details.st_mode & 0o077):
+                raise ConfigError(f"unsafe provider slot lock: {path}")
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                return fd
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+        except OSError as exc:
+            raise ConfigError(f"cannot acquire provider slot {path}: {exc}") from exc
+        finally:
+            if fd is not None and not acquired:
+                os.close(fd)
+    return None
+
+
+def release_slot(fd):
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def all_slots_busy():
+    """Hook can allow Codex's original read when every worker is at capacity."""
+    limit = setting("max_concurrency", 5)
+    for profile in profiles():
+        fd = acquire_slot(profile["name"], limit)
+        if fd is not None:
+            release_slot(fd)
+            return False
+    return True

@@ -10,7 +10,7 @@ import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from settings import ConfigError, load_config, paused, setting
+from settings import ConfigError, all_slots_busy, load_config, paused, setting
 
 
 def python_read(argv):
@@ -152,6 +152,8 @@ def decision(event):
                 oversized = sum(1 for _ in itertools.islice(stream, limit + 1)) > limit
         except OSError:
             continue
+        if oversized and all_slots_busy():
+            return {}  # Every Worker is at capacity: allow the original Codex read.
         if oversized:
             reason = (f"{name} exceeds {limit} lines. Use the shunt bulk-reader skill for "
                       "summarization, or use a targeted read for exact edits.")

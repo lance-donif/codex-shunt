@@ -33,6 +33,7 @@
   "reply_tokens": 128000,
   "max_payload_bytes": 512000,
   "chunk_summary_tokens": 8192,
+  "max_concurrency": 5,
   "timeout_seconds": 300,
   "min_lines": 350
 }

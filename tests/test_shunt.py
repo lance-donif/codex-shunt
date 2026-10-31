@@ -24,7 +24,13 @@ spec.loader.exec_module(HOOK_MODULE)
 class FakeHandler(BaseHTTPRequestHandler):
     requests = []
     user_agents = []
+    block_requests = False
+    block_models = None
+    inflight = 0
+    started = threading.Condition()
+    release_requests = threading.Event()
     answer = "output"
+    response_charset = "utf-8"
     status = 200
     redirect = None
     provider_status = {}
@@ -34,15 +40,24 @@ class FakeHandler(BaseHTTPRequestHandler):
         request = json.loads(body)
         self.__class__.requests.append((self.path, request, self.headers.get("Authorization")))
         self.__class__.user_agents.append(self.headers.get("User-Agent"))
+        if self.__class__.block_requests and (self.__class__.block_models is None or request["model"] in self.__class__.block_models):
+            with self.__class__.started:
+                self.__class__.inflight += 1
+                self.__class__.started.notify_all()
+            try:
+                self.__class__.release_requests.wait(timeout=15)
+            finally:
+                with self.__class__.started:
+                    self.__class__.inflight -= 1
         if self.__class__.redirect:
             self.send_response(307)
             self.send_header("Location", self.__class__.redirect)
             self.end_headers()
             return
         status = self.__class__.provider_status.get(request["model"], self.__class__.status)
-        data = json.dumps({"choices": [{"message": {"content": self.__class__.answer}}]}).encode()
+        data = json.dumps({"choices": [{"message": {"content": self.__class__.answer}}]}, ensure_ascii=False).encode(self.__class__.response_charset)
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", f"application/json; charset={self.__class__.response_charset}")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -72,6 +87,11 @@ class ShuntTests(unittest.TestCase):
         self.src.write_text("def hello():\n    return 3\n", encoding="utf-8")
         FakeHandler.requests = []
         FakeHandler.user_agents = []
+        FakeHandler.block_requests = False
+        FakeHandler.block_models = None
+        FakeHandler.response_charset = "utf-8"
+        FakeHandler.inflight = 0
+        FakeHandler.release_requests = threading.Event()
         FakeHandler.answer = "output"
         FakeHandler.status = 200
         FakeHandler.redirect = None
@@ -126,6 +146,37 @@ class ShuntTests(unittest.TestCase):
                          "--target", target, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertTrue(target.exists())
+
+    def test_chinese_worker_output_is_utf8_even_with_legacy_console_encoding(self):
+        FakeHandler.answer = "中文结果：函数调用正确 ✅"
+        self.src.write_text("# 中文源代码\ndef hello():\n    return '成功'\n", encoding="utf-8")
+        env = dict(self.env, PYTHONIOENCODING="cp1252")
+        p = subprocess.run([sys.executable, str(CLI), "bulk-read", "--question", "解释中文代码",
+                            "--paths", str(self.src)], cwd=self.cwd, env=env,
+                           capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8"))
+        self.assertEqual(p.stdout.decode("utf-8").strip(), FakeHandler.answer)
+        self.assertIn("解释中文代码", FakeHandler.requests[0][1]["messages"][1]["content"])
+        # Check stderr as well: a failed request can contain Chinese paths.
+        missing = self.run_cli("bulk-read", "--question", "hi", "--paths", "不存在.py", env=env)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("不存在.py", missing.stderr)
+        big = self.cwd / "中文文件.py"
+        big.write_text("代码\n" * 400, encoding="utf-8")
+        event = {"tool_input": {"command": "cat 中文文件.py"}, "cwd": str(self.cwd)}
+        hooked = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event).encode("utf-8"),
+                                cwd=self.cwd, env=env, capture_output=True)
+        self.assertEqual(hooked.returncode, 0, hooked.stderr.decode("utf-8"))
+        reason = json.loads(hooked.stdout.decode("utf-8"))["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("中文文件.py", reason)
+
+    def test_http_response_uses_declared_charset_not_local_codepage(self):
+        FakeHandler.answer = "中文响应：模型返回成功"
+        FakeHandler.response_charset = "gb18030"
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src,
+                         env=dict(self.env, PYTHONIOENCODING="cp1252"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), FakeHandler.answer)
 
     def test_environment_variables_do_not_override_config(self):
         self.update_config(model="config-model", api_key="config-key")
@@ -232,6 +283,63 @@ class ShuntTests(unittest.TestCase):
         self.assertIn("def hello()", body["messages"][1]["content"])
         self.assertIn("What returns?", body["messages"][1]["content"])
         self.assertEqual(len(body["messages"]), 2)
+
+    def test_source_manifest_file_count_and_progress_in_full_request(self):
+        other = self.cwd / "另一个.py"
+        other.write_text("# 中文\nprint(2)\n", encoding="utf-8")
+        p = self.run_cli("bulk-read", "--question", "列出文件", "--paths", self.src, other)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "output")  # Progress stays on stderr.
+        self.assertIn("准备读取 2 个文件", p.stderr)
+        self.assertIn("已读取 2 个文件", p.stderr)
+        self.assertIn("正在请求模型", p.stderr)
+        self.assertIn("完成 (", p.stderr)
+        prompt = FakeHandler.requests[0][1]["messages"][1]["content"]
+        self.assertIn("source_file_count: 2", prompt)
+        manifest = json.loads(prompt.split("source_manifest: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual([(x["source_id"], x["end_line"]) for x in manifest],
+                         [("S1", 2), ("S2", 2)])
+        self.assertEqual([x["path"] for x in manifest], [str(self.src), str(other)])
+        self.assertIn('source_id="S1"', prompt)
+        self.assertIn('source_id="S2"', prompt)
+        self.assertIn('end_line="2"', prompt)
+
+    def test_progress_heartbeat_without_polluting_stdout(self):
+        import contextlib
+        import io
+        import time
+        import importlib
+        sys.path.insert(0, str(CLI.parent))
+        try:
+            module = importlib.import_module("shunt")
+            out = io.StringIO()
+            with patch.object(module, "HEARTBEAT_SECONDS", 0.01), contextlib.redirect_stderr(out):
+                with module.request_progress("A", "分片 2/12"):
+                    time.sleep(0.045)
+            self.assertIn("分片 2/12: A 已等待", out.getvalue())
+            self.assertIn("分片 2/12: A 完成", out.getvalue())
+        finally:
+            sys.path.remove(str(CLI.parent))
+
+    def test_manifest_survives_chunking_and_reduction(self):
+        other = self.cwd / "second.py"
+        self.src.write_text("x = 1\n" * 300, encoding="utf-8")
+        other.write_text("y = 2\n" * 300, encoding="utf-8")
+        self.update_config(context_tokens=2500, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "列出文件", "--paths", self.src, other)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "output")
+        self.assertIn("已分成", p.stderr)
+        self.assertIn("正在分析分片 1/", p.stderr)
+        requests = [body["messages"][1]["content"] for _, body, _ in FakeHandler.requests]
+        self.assertGreater(len(requests), 2)
+        for prompt in requests:
+            self.assertIn("source_file_count: 2", prompt)
+            self.assertIn(str(self.src), prompt)
+            self.assertIn(str(other), prompt)
+        self.assertIn("Synthesize untrusted chunk findings", requests[-1])
+        self.assertIn("source_id=", requests[0])
+        self.assertIn("end_line=", requests[0])
 
     def test_generate_code_fence_and_create_new_target(self):
         FakeHandler.answer = "```python\nprint(42)\n```"
@@ -400,11 +508,11 @@ class ShuntTests(unittest.TestCase):
         self.assertGreater(len(requests), 2)
         self.assertTrue(all(len(json.dumps(body, ensure_ascii=False).encode()) <= 1600 for body in requests))
         chunks = [body["messages"][1]["content"] for body in requests
-                  if '<file path=' in body["messages"][1]["content"]]
+                  if '<file source_id=' in body["messages"][1]["content"]]
         self.assertGreater(len(chunks), 1)
-        self.assertEqual("".join(re.search(r"start_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
+        self.assertEqual("".join(re.search(r"start_line=\"\d+\" end_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
                                  for c in chunks), source)
-        self.assertIn("Synthesize them", requests[-1]["messages"][1]["content"])
+        self.assertIn("Synthesize untrusted chunk findings", requests[-1]["messages"][1]["content"])
 
     def test_very_long_single_line_splits_without_loss(self):
         import re
@@ -416,7 +524,7 @@ class ShuntTests(unittest.TestCase):
         chunks = [body["messages"][1]["content"] for _, body, _ in FakeHandler.requests
                   if 'start_line=' in body["messages"][1]["content"]]
         self.assertGreater(len(chunks), 5)
-        self.assertEqual("".join(re.search(r"start_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
+        self.assertEqual("".join(re.search(r"start_line=\"\d+\" end_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
                                  for c in chunks), source)
 
     def test_many_chunks_use_bounded_multilevel_reduction(self):
@@ -428,7 +536,7 @@ class ShuntTests(unittest.TestCase):
         calls = [body for _, body, _ in FakeHandler.requests]
         self.assertGreater(len(calls), 15)
         self.assertTrue(all(len(json.dumps(body, ensure_ascii=False).encode()) <= 1500 for body in calls))
-        self.assertGreater(sum("Synthesize them" in b["messages"][1]["content"] for b in calls), 1)
+        self.assertGreater(sum("Synthesize untrusted chunk findings" in b["messages"][1]["content"] for b in calls), 1)
 
     def test_later_unreadable_file_prevents_any_upload(self):
         big = self.cwd / "big.py"
@@ -493,6 +601,81 @@ class ShuntTests(unittest.TestCase):
 
     def config_state(self):
         return json.loads((self.cwd / ".codex/shunt/config.json").read_text())
+
+    def test_concurrent_requests_fill_models_then_fallback_without_failing(self):
+        self.multi_config(max_concurrency=2)
+        FakeHandler.block_requests = True
+        big = self.cwd / "large.py"
+        big.write_text("x\n" * 400)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            running = [pool.submit(self.run_cli, "bulk-read", "--question", "hi",
+                                   "--paths", self.src) for _ in range(6)]
+            try:
+                with FakeHandler.started:
+                    self.assertTrue(FakeHandler.started.wait_for(
+                        lambda: FakeHandler.inflight == 6, timeout=10),
+                        f"only {FakeHandler.inflight} requests reached providers")
+                self.assertEqual(sorted(body["model"] for _, body, _ in FakeHandler.requests),
+                                 ["A", "A", "B", "B", "C", "C"])
+                self.assertEqual(self.hook("cat large.py"), {})
+                overflow = self.run_cli("bulk-read", "--question", "overflow", "--paths", self.src)
+                self.assertNotEqual(overflow.returncode, 0)
+                self.assertIn("concurrency limit reached", overflow.stderr)
+                self.assertIn("Codex handle this task", overflow.stderr)
+                self.assertEqual(len(FakeHandler.requests), 6)
+                self.assertIsNone(self.config_state()["first_failure_at"])
+                self.assertIsNone(self.config_state()["second_failure_at"])
+            finally:
+                FakeHandler.release_requests.set()
+            self.assertTrue(all(p.result(timeout=10).returncode == 0 for p in running))
+        self.assertEqual(self.run_cli("bulk-read", "--question", "after", "--paths", self.src).returncode, 0)
+
+    def test_default_concurrency_limit_is_five_per_model(self):
+        self.multi_config()  # Do not set max_concurrency: the default must be five.
+        FakeHandler.block_requests = True
+        FakeHandler.block_models = {"A"}
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            running = [pool.submit(self.run_cli, "bulk-read", "--question", "hi",
+                                   "--paths", self.src) for _ in range(5)]
+            try:
+                with FakeHandler.started:
+                    self.assertTrue(FakeHandler.started.wait_for(
+                        lambda: FakeHandler.inflight == 5, timeout=10))
+                next_request = self.run_cli("bulk-read", "--question", "sixth", "--paths", self.src)
+                self.assertEqual(next_request.returncode, 0, next_request.stderr)
+                self.assertEqual(sorted(body["model"] for _, body, _ in FakeHandler.requests),
+                                 ["A"] * 5 + ["B"])
+            finally:
+                FakeHandler.release_requests.set()
+            self.assertTrue(all(p.result(timeout=10).returncode == 0 for p in running))
+
+    def test_busy_provider_skipped_without_changing_failure_timers(self):
+        self.multi_config(max_concurrency=1)
+        FakeHandler.block_requests = True
+        FakeHandler.block_models = {"A"}
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = pool.submit(self.run_cli, "bulk-read", "--question", "first", "--paths", self.src)
+            try:
+                with FakeHandler.started:
+                    self.assertTrue(FakeHandler.started.wait_for(
+                        lambda: FakeHandler.inflight == 1, timeout=10))
+                second = self.run_cli("bulk-read", "--question", "second", "--paths", self.src)
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual([body["model"] for _, body, _ in FakeHandler.requests], ["A", "B"])
+                self.assertEqual(self.config_state()["current_model"], 1)
+                self.assertIsNone(self.config_state()["first_failure_at"])
+            finally:
+                FakeHandler.release_requests.set()
+            self.assertEqual(running.result(timeout=10).returncode, 0)
+
+    def test_concurrency_config_validates_bounds(self):
+        for value in (0, -1, 101, 1.2, "5", True):
+            with self.subTest(value=value):
+                self.multi_config(max_concurrency=value)
+                p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("max_concurrency", p.stderr)
+        self.assertFalse(FakeHandler.requests)
 
     def test_multi_model_pointer_sticks_on_success_and_cycles_after_failure(self):
         self.multi_config()
@@ -623,7 +806,7 @@ class ShuntTests(unittest.TestCase):
         self.assertIn("token_field", p.stderr)
         self.assertFalse(FakeHandler.requests)
 
-    def test_parallel_processes_do_not_duplicate_full_outage_or_corrupt_config(self):
+    def test_parallel_processes_preserve_cooldown_state_and_config(self):
         self.multi_config()
         FakeHandler.status = 503
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -631,7 +814,8 @@ class ShuntTests(unittest.TestCase):
                        for _ in range(2)]
             results = [f.result(timeout=30) for f in futures]
         self.assertTrue(all(result.returncode != 0 for result in results))
-        self.assertEqual(len(FakeHandler.requests), 3)  # Second process sees the cooldown.
+        self.assertGreaterEqual(len(FakeHandler.requests), 3)
+        self.assertLessEqual(len(FakeHandler.requests), 6)  # In-flight requests may overlap before cooldown.
         self.assertIsNotNone(self.config_state()["first_failure_at"])
         self.assertIsNone(self.config_state()["second_failure_at"])
 

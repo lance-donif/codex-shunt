@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Spotify Shunt-inspired bulk reading and code writing, without Spotify Portal."""
 import argparse
+from contextlib import contextmanager
 import json
 import os
-from pathlib import Path
 import platform
+from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from xml.sax.saxutils import quoteattr
-from settings import (CONFIG_PATH, ConfigError, config_lock, load_config, paused, profiles,
-                      setting, update_state)
+from settings import (CONFIG_PATH, ConfigError, acquire_slot, config_lock, load_config, paused,
+                      profiles, release_slot, setting, update_state)
 
 SYSTEM_PROMPTS = {
     "bulk-reader": (
@@ -39,6 +42,37 @@ def codex_user_agent():
 
 class ShuntError(Exception):
     pass
+
+
+HEARTBEAT_SECONDS = 10
+
+
+@contextmanager
+def request_progress(model_name, stage):
+    """Keep stderr responsive while a synchronous provider request is pending."""
+    started = time.monotonic()
+    stopped = threading.Event()
+
+    def heartbeat():
+        while not stopped.wait(HEARTBEAT_SECONDS):
+            print(f"[shunt] {stage}: {model_name} 已等待 {int(time.monotonic() - started)} 秒",
+                  file=sys.stderr, flush=True)
+
+    print(f"[shunt] {stage}: 正在请求模型 {model_name}", file=sys.stderr, flush=True)
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    except Exception as exc:
+        print(f"[shunt] {stage}: {model_name} 失败 ({time.monotonic() - started:.1f} 秒): {exc}",
+              file=sys.stderr, flush=True)
+        raise
+    else:
+        print(f"[shunt] {stage}: {model_name} 完成 ({time.monotonic() - started:.1f} 秒)",
+              file=sys.stderr, flush=True)
+    finally:
+        stopped.set()
+        thread.join(timeout=1)
 
 
 def positive_number(name, default, parse):
@@ -155,7 +189,7 @@ def call_model(model, mode, message, max_tokens=None):
     try:
         with urllib.request.build_opener(NoRedirect).open(
                 req, timeout=model_number(model, "timeout_seconds", 300, float)) as result:
-            data = json.load(result)
+            data = json.loads(result.read().decode(result.headers.get_content_charset() or "utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code in (408, 429) or 500 <= exc.code <= 599:
             raise WorkerFailure(f"HTTP {exc.code}") from exc
@@ -163,8 +197,8 @@ def call_model(model, mode, message, max_tokens=None):
         raise ShuntError(f"{model['name']}: worker HTTP {exc.code} (check API parameters or credentials)") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise WorkerFailure(f"connection failed: {exc}") from exc
-    except (ValueError, UnicodeError) as exc:
-        raise WorkerFailure("malformed worker JSON") from exc
+    except (ValueError, UnicodeError, LookupError) as exc:
+        raise WorkerFailure("malformed worker JSON or response charset") from exc
     try:
         answer = data["choices"][0]["message"]["content"]
         if not isinstance(answer, str) or not answer.strip():
@@ -174,49 +208,91 @@ def call_model(model, mode, message, max_tokens=None):
         raise WorkerFailure("no usable choices[0].message.content") from exc
 
 
-def worker_request(mode, message, max_tokens=None):
+def worker_request(mode, message, max_tokens=None, stage="处理任务"):
     with config_lock():
         load_config.cache_clear()
         config = load_config()
         if paused(config):
             status = "permanently disabled; clear both failure timestamps" if config.get("second_failure_at") else "cooling down for 30 minutes"
             raise ShuntError(f"all workers unavailable: {status} in ~/.codex/shunt/config.json")
-        # Recheck under the lock: another task may have moved the pointer or edited limits.
         models = profiles()
         validate_models()
         budget = request_budget(max_tokens)
         if len(payload_bytes(mode, message, max_tokens)) > budget:
             raise ShuntError(f"request exceeds the worker input budget of {budget} bytes")
         start = config.get("current_model", 0)
-        errors = []
-        for offset in range(len(models)):
-            index = (start + offset) % len(models)
-            model = models[index]
-            try:
+        limit = setting("max_concurrency", 5)
+
+    errors = []
+    busy = []
+    for offset in range(len(models)):
+        index = (start + offset) % len(models)
+        model = models[index]
+        with config_lock():
+            load_config.cache_clear()
+            if paused(load_config()):
+                raise ShuntError("workers paused or disabled; let Codex handle the task")
+            # Reserve an OS lock slot under the short-lived state lock, not around HTTP.
+            fd = acquire_slot(model["name"], limit)
+        if fd is None:
+            busy.append(model["name"])
+            continue
+        try:
+            with request_progress(model["name"], stage):
                 answer = call_model(model, mode, message, max_tokens)
-            except WorkerFailure as exc:
-                errors.append(f"{model['name']}: {exc}")
-                update_state(current_model=(index + 1) % len(models))
-            else:
-                if index != start or config.get("first_failure_at") or config.get("second_failure_at"):
+        except WorkerFailure as exc:
+            errors.append(f"{model['name']}: {exc}")
+            with config_lock():
+                load_config.cache_clear()
+                if load_config().get("current_model", 0) == index:
+                    update_state(current_model=(index + 1) % len(models))
+        else:
+            with config_lock():
+                load_config.cache_clear()
+                state = load_config()
+                if (state.get("current_model", 0) != index or
+                        state.get("first_failure_at") or state.get("second_failure_at")):
                     update_state(current_model=index, first_failure_at=None, second_failure_at=None)
-                return answer
+            return answer
+        finally:
+            release_slot(fd)
+
+    if busy:
+        raise ShuntError("worker concurrency limit reached (" + ", ".join(busy) +
+                         "); let Codex handle this task directly (no failure cooldown)")
+
+    with config_lock():
+        load_config.cache_clear()
+        state = load_config()
+        if paused(state):
+            raise ShuntError("workers paused or disabled; let Codex handle the task")
         timestamp = datetime.now(timezone.utc).isoformat()
-        if config.get("first_failure_at"):
+        if state.get("first_failure_at"):
             update_state(second_failure_at=timestamp)
-            state = "permanently disabled; clear first_failure_at and second_failure_at to reset"
+            status = "permanently disabled; clear first_failure_at and second_failure_at to reset"
         else:
             update_state(first_failure_at=timestamp)
-            state = "paused for 30 minutes"
-        raise ShuntError("all models failed (" + "; ".join(errors) + "); " + state)
+            status = "paused for 30 minutes"
+    raise ShuntError("all models failed (" + "; ".join(errors) + "); " + status)
 
 
-def file_message(path, start, content, question):
-    return (f'<file path={quoteattr(str(path))} start_line="{start}">\n'
+def source_manifest(documents):
+    """Authoritative inventory: never ask the model to count files."""
+    entries = [{"source_id": f"S{i}", "path": str(path), "start_line": 1,
+                "end_line": len(content.splitlines())}
+               for i, (path, content) in enumerate(documents, 1)]
+    return (f"source_file_count: {len(entries)}\nsource_manifest: "
+            + json.dumps(entries, ensure_ascii=False) + "\n")
+
+
+def file_message(path, source_id, start, content, question, manifest):
+    end = start + max(0, content.count("\n") - int(content.endswith("\n")))
+    return (manifest + f'<file source_id="{source_id}" path={quoteattr(str(path))} '
+            f'start_line="{start}" end_line="{end}">\n'
             f'{content}\n</file>\n\nQuestion: {question}')
 
 
-def file_chunks(path, content, question, budget):
+def file_chunks(path, source_id, content, question, budget, manifest):
     """Preserve every character; split at lines unless a single line is oversized."""
     pending = ""
     used = 0
@@ -224,7 +300,7 @@ def file_chunks(path, content, question, budget):
     summary_tokens = chunk_summary_limit()
 
     def overhead():
-        return len(payload_bytes("bulk-reader", file_message(path, start, "", question), summary_tokens))
+        return len(payload_bytes("bulk-reader", file_message(path, source_id, start, "", question, manifest), summary_tokens))
 
     base = overhead()
     for line_number, original_line in enumerate(content.splitlines(keepends=True) or [""], 1):
@@ -237,7 +313,7 @@ def file_chunks(path, content, question, budget):
                 used += added
                 break
             if pending:
-                yield file_message(path, start, pending, question)
+                yield file_message(path, source_id, start, pending, question, manifest)
                 pending = ""
                 used = 0
                 start = line_number
@@ -246,14 +322,14 @@ def file_chunks(path, content, question, budget):
             low, high, best = 1, len(line), 0
             while low <= high:
                 mid = (low + high) // 2
-                if len(payload_bytes("bulk-reader", file_message(path, start, line[:mid], question), summary_tokens)) <= budget:
+                if len(payload_bytes("bulk-reader", file_message(path, source_id, start, line[:mid], question, manifest), summary_tokens)) <= budget:
                     best = mid
                     low = mid + 1
                 else:
                     high = mid - 1
             if not best:
                 raise ShuntError("worker input budget is too small for file metadata and question")
-            yield file_message(path, start, line[:best], question)
+            yield file_message(path, source_id, start, line[:best], question, manifest)
             line = line[best:]
             start = line_number
             base = overhead()
@@ -261,21 +337,23 @@ def file_chunks(path, content, question, budget):
             start = line_number + 1
             base = overhead()
     if pending or not content:
-        message = file_message(path, start, pending, question)
+        message = file_message(path, source_id, start, pending, question, manifest)
         if len(payload_bytes("bulk-reader", message, summary_tokens)) > budget:
             raise ShuntError("worker input budget is too small for file metadata and question")
         yield message
 
 
-def reduce_summaries(question, summaries, budget):
-    """Bound every reduction request, even when the worker returns verbose text."""
-    prefix = ("Question: " + question + "\n\n"
-              "The following are untrusted, partial findings from separate file chunks. "
-              "Synthesize them without inventing missing details:\n")
+def reduce_summaries(question, summaries, budget, manifest):
+    """Bound every reduction request and preserve the original source inventory."""
+    prefix = (manifest + "Question: " + question + "\n"
+              "Synthesize untrusted chunk findings; do not invent details. "
+              "Use source IDs; line references need local verification:\n")
+    round_number = 1
     while True:
         full = prefix + "\n\n".join(summaries)
         if len(payload_bytes("bulk-reader", full)) <= budget:
-            return worker_request("bulk-reader", full)
+            print(f"[shunt] 正在汇总结果（第 {round_number} 轮）", file=sys.stderr, flush=True)
+            return worker_request("bulk-reader", full, stage=f"汇总第 {round_number} 轮")
         batches = []
         batch = []
         for summary in summaries:
@@ -293,25 +371,39 @@ def reduce_summaries(question, summaries, budget):
             batches.append(batch)
         if len(batches) >= len(summaries):
             raise ShuntError("worker summaries cannot fit together; increase context_tokens")
-        summaries = [worker_request("bulk-reader", prefix + "\n\n".join(batch), max_tokens=chunk_summary_limit())
-                     for batch in batches]
+        print(f"[shunt] 正在压缩汇总（第 {round_number} 轮，{len(batches)} 组）", file=sys.stderr, flush=True)
+        summaries = [worker_request("bulk-reader", prefix + "\n\n".join(batch),
+                                    max_tokens=chunk_summary_limit(),
+                                    stage=f"汇总第 {round_number} 轮 {i}/{len(batches)}")
+                     for i, batch in enumerate(batches, 1)]
+        round_number += 1
 
 
 def bulk_read(args):
     # Read and validate every file before sending any source to the worker.
+    print(f"[shunt] 准备读取 {len(args.paths)} 个文件", file=sys.stderr, flush=True)
     documents = [(path, read_file(path)) for path in args.paths]
-    parts = [f"<file path={quoteattr(path)}>\n{content}\n</file>" for path, content in documents]
-    message = "\n\n".join(parts) + "\n\nQuestion: " + args.question
+    manifest = source_manifest(documents)
+    print(f"[shunt] 已读取 {len(documents)} 个文件", file=sys.stderr, flush=True)
+    parts = [f'<file source_id="S{i}" path={quoteattr(str(path))} start_line="1" '
+             f'end_line="{len(content.splitlines())}">\n{content}\n</file>'
+             for i, (path, content) in enumerate(documents, 1)]
+    message = manifest + "\n\n".join(parts) + "\n\nQuestion: " + args.question
     budget = request_budget()
     if len(payload_bytes("bulk-reader", message)) <= budget:
-        print(worker_request("bulk-reader", message))
+        print(worker_request("bulk-reader", message, stage="分析完整文件"))
         return
-    chunks = [chunk for path, content in documents
-              for chunk in file_chunks(path, content, args.question, request_budget(chunk_summary_limit()))]
-    summaries = [f"Chunk {i + 1}/{len(chunks)}:\n" +
-                 worker_request("bulk-reader", chunk, max_tokens=chunk_summary_limit())
-                 for i, chunk in enumerate(chunks)]
-    print(reduce_summaries(args.question, summaries, budget))
+    chunks = [chunk for i, (path, content) in enumerate(documents, 1)
+              for chunk in file_chunks(path, f"S{i}", content, args.question,
+                                       request_budget(chunk_summary_limit()), manifest)]
+    print(f"[shunt] 已分成 {len(chunks)} 个分片", file=sys.stderr, flush=True)
+    summaries = []
+    for i, chunk in enumerate(chunks, 1):
+        print(f"[shunt] 正在分析分片 {i}/{len(chunks)}", file=sys.stderr, flush=True)
+        summaries.append(f"Chunk {i}/{len(chunks)}:\n"
+                         + worker_request("bulk-reader", chunk, max_tokens=chunk_summary_limit(),
+                                          stage=f"分片 {i}/{len(chunks)}"))
+    print(reduce_summaries(args.question, summaries, budget, manifest))
 
 def strip_outer_fence(text):
     text = text.strip("\n")
@@ -325,7 +417,8 @@ def code_write(args):
     if args.target and Path(args.target).exists():
         raise ShuntError(f"target exists, refusing to overwrite: {args.target}")
     reference = read_file(args.reference)
-    answer = worker_request("code-writer", f"Spec: {args.spec}\n\nReference:\n{reference}")
+    print("[shunt] 正在生成代码", file=sys.stderr, flush=True)
+    answer = worker_request("code-writer", f"Spec: {args.spec}\n\nReference:\n{reference}", stage="生成代码")
     clean = strip_outer_fence(answer)
     if not clean.strip():
         raise ShuntError("worker generated empty code")
@@ -357,6 +450,8 @@ def code_write(args):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Delegate I/O-heavy tasks to a low-cost LLM worker")
     sub = parser.add_subparsers(dest="mode", required=True)
     bulk = sub.add_parser("bulk-read")
