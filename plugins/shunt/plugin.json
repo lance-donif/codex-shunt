@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "shunt",
+  "version": "0.2.0",
+  "description": "Codex bulk file reading and boilerplate delegation through an OpenAI-compatible low-cost worker.",
+  "license": "Apache-2.0",
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "interface": {
+        "displayName": "Codex Shunt",
+        "shortDescription": "Delegate bulk reads and boilerplate to a cheaper worker",
+        "developerName": "Community adaptation of Spotify Shunt",
+        "category": "Developer Tools",
+        "capabilities": ["Read", "Write", "CLI"]
+      }
+    }
+  }
+}

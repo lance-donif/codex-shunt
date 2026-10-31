@@ -1,0 +1,10 @@
+Codex Shunt -- independent adaptation of Spotify Shunt architecture
+
+Inspired by the two Skills, script commands, read interception and one-shot
+worker delegation design of Spotify's portal-ai-plugins/plugins/shunt project:
+https://github.com/spotify/portal-ai-plugins
+
+Upstream: Copyright Spotify; licensed under Apache License, Version 2.0.
+This version replaces Portal/AiKA calls with an OpenAI-compatible HTTP transport,
+changes the hook and code-writing behavior, and adds a Codex local marketplace.
+No affiliation with or endorsement by Spotify is claimed.
