@@ -5,6 +5,8 @@ description: Delegate large source file reading, codebase summaries and multi-fi
 
 This skill belongs to a Codex Shunt plugin. Resolve the plugin root as two parent directories above this SKILL.md's directory (`skills/shunt-bulk-reader` or `skills/bulk-reader`). Do not rely on a shell-wide `PLUGIN_ROOT` environment variable.
 
+**Do not run Codex Shunt's own test suite** (`tests/test_shunt.py` or `python3 -m unittest discover -s tests`) during normal plugin use or when working on a user's project. Those tests are for maintainers changing Shunt itself, and should run only when explicitly requested. This does not prohibit running the user's project's tests when needed for the task.
+
 When you need a broad summary of large files (roughly >350 lines) or multi-file analysis, and the files contain no credentials/private secrets, execute:
 
 ```bash

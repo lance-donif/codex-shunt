@@ -15,6 +15,8 @@ codex
 
 在 Codex 里输入 `/plugins`，安装 **Codex Shunt**，然后开启新任务。
 
+**日常使用不要运行 Shunt 插件自身的测试**（`tests/test_shunt.py` / `python3 -m unittest discover -s tests`）。这些测试只用于明确要求开发或验证 Shunt 插件本身的维护任务；**用户项目的测试不受影响**，Codex 在修改用户代码后仍应按任务需要运行。
+
 **安装后在 `/hooks` 审查并信任 Shunt 的 `PreToolUse` Hook**，否则它不会执行。之前安装过旧版的，请刷新并重装一次（不会删除 `~/.codex/shunt/config.json`）：
 
 ```bash
@@ -97,13 +99,15 @@ python3 plugins/shunt/scripts/shunt.py code-write --spec "生成单元测试" --
 
 **注意：** Windows 上 CLI 的标准输出和错误输出强制使用 UTF-8；Worker HTTP 响应按 `Content-Type` 字符集（未声明时 UTF-8）解码。全部模型并发满额时，不等待、不排队，Codex 应直接完成任务。请求占用的是跨进程系统文件锁，进程退出自动释放。冷却或停用时 Hook 会放行 Codex 自己读取文件；不会后台重试。远程 Worker 会收到选中的源文件，切勿委托密钥或敏感内容。超时切换可能重复计费；摘要可能漏掉跨分片细节。生成代码不会覆盖已有文件。
 
-测试（开发者克隆仓库后）：`python3 -m unittest discover -s tests -v`。
+仅限插件维护者：明确需要开发或验证 **Shunt 本身**时才执行 `python3 -m unittest discover -s tests -v`，普通使用者及 Codex 处理其他项目时不应运行该测试。
 
 ## English
 
 Codex plugin for low-cost AI workers, with ordered multi-provider fallback and Ollama support. Requires Codex CLI and Python 3.9+.
 
 **Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task. Review and trust `PreToolUse` in `/hooks`. If upgrading from an older version, run `codex plugin marketplace upgrade codex-shunt-local`, remove `shunt@codex-shunt-local`, and install it again. Two standalone Python CLI commands (`bulk-read`, `code-write`) are also available in `plugins/shunt/scripts/shunt.py`.
+
+**Tests:** Do not automatically run the Shunt plugin's own tests (`tests/test_shunt.py` or `python3 -m unittest discover -s tests`) while using the plugin. They are maintainer-only unless explicitly requested. Run tests belonging to the user's project when appropriate.
 
 **Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. `max_concurrency` defaults to 5 requests per provider; when all are busy Codex should handle the task itself without marking providers failed. Set model-specific reasoning parameters and context limits if your provider supports them. `chunk_summary_tokens` defaults to **8192** (capped by each model’s reply budget). On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
 
