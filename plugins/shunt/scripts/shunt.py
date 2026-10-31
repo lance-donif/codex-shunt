@@ -2,6 +2,7 @@
 """Spotify Shunt-inspired bulk reading and code writing, without Spotify Portal."""
 import argparse
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import platform
@@ -109,6 +110,10 @@ class WorkerFailure(ShuntError):
     pass
 
 
+class RateLimited(WorkerFailure):
+    pass
+
+
 def model_number(model, name, default, parse=int):
     raw = model.get(name, setting(name, default))
     try:
@@ -191,7 +196,9 @@ def call_model(model, mode, message, max_tokens=None):
                 req, timeout=model_number(model, "timeout_seconds", 300, float)) as result:
             data = json.loads(result.read().decode(result.headers.get_content_charset() or "utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code in (408, 429) or 500 <= exc.code <= 599:
+        if exc.code == 429:
+            raise RateLimited("HTTP 429") from exc
+        if exc.code == 408 or 500 <= exc.code <= 599:
             raise WorkerFailure(f"HTTP {exc.code}") from exc
         # Invalid requests, missing credentials and redirects must not trip failover.
         raise ShuntError(f"{model['name']}: worker HTTP {exc.code} (check API parameters or credentials)") from exc
@@ -239,7 +246,13 @@ def worker_request(mode, message, max_tokens=None, stage="处理任务"):
             continue
         try:
             with request_progress(model["name"], stage):
-                answer = call_model(model, mode, message, max_tokens)
+                try:
+                    answer = call_model(model, mode, message, max_tokens)
+                except RateLimited:
+                    print(f"[shunt] {stage}: {model['name']} 返回 HTTP 429，1 秒后重试一次",
+                          file=sys.stderr, flush=True)
+                    time.sleep(1)
+                    answer = call_model(model, mode, message, max_tokens)
         except WorkerFailure as exc:
             errors.append(f"{model['name']}: {exc}")
             with config_lock():
@@ -377,16 +390,30 @@ def bulk_read(args):
     if len(payload_bytes("bulk-reader", message)) <= budget:
         print(worker_request("bulk-reader", message, stage="分析完整文件"))
         return
-    chunks = [chunk for i, (path, content) in enumerate(documents, 1)
-              for chunk in file_chunks(path, f"S{i}", content, args.question,
-                                       request_budget(chunk_summary_limit()), manifest)]
-    print(f"[shunt] 已分成 {len(chunks)} 个分片", file=sys.stderr, flush=True)
+    # Keep files sequential; only chunks belonging to the same file may overlap.
+    file_chunks_list = [list(file_chunks(path, f"S{i}", content, args.question,
+                                    request_budget(chunk_summary_limit()), manifest))
+                        for i, (path, content) in enumerate(documents, 1)]
+    total = sum(len(parts) for parts in file_chunks_list)
+    print(f"[shunt] 已分成 {total} 个分片", file=sys.stderr, flush=True)
+
+    def analyze(item):
+        index, chunk = item
+        print(f"[shunt] 正在分析分片 {index}/{total}", file=sys.stderr, flush=True)
+        return (f"Chunk {index}/{total}:\n"
+                + worker_request("bulk-reader", chunk, max_tokens=chunk_summary_limit(),
+                                 stage=f"分片 {index}/{total}"))
+
     summaries = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"[shunt] 正在分析分片 {i}/{len(chunks)}", file=sys.stderr, flush=True)
-        summaries.append(f"Chunk {i}/{len(chunks)}:\n"
-                         + worker_request("bulk-reader", chunk, max_tokens=chunk_summary_limit(),
-                                          stage=f"分片 {i}/{len(chunks)}"))
+    offset = 0
+    for parts in file_chunks_list:
+        jobs = list(enumerate(parts, offset + 1))
+        if len(jobs) == 1:
+            summaries.append(analyze(jobs[0]))
+        elif jobs:
+            with ThreadPoolExecutor(max_workers=min(3, len(jobs))) as pool:
+                summaries.extend(pool.map(analyze, jobs))  # Keep source order for reduction.
+        offset += len(parts)
     print(reduce_summaries(args.question, summaries, budget, manifest))
 
 def strip_outer_fence(text):

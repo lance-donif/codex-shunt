@@ -1,6 +1,6 @@
 {
   "name": "shunt",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Codex bulk file reading and boilerplate delegation through an OpenAI-compatible low-cost worker.",
   "license": "Apache-2.0",
   "hooks": "./hooks/hooks.json",

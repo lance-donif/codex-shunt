@@ -20,3 +20,5 @@ Chunk summaries use `chunk_summary_tokens` (default 8192) from the user JSON con
 If every Worker provider is at its `max_concurrency` limit (default 5 requests per provider), do not retry or wait. Read and solve the task with Codex directly. Capacity exhaustion is not a model failure and must not advance failure timestamps.
 
 For trustworthy file counts, use `source_file_count` and `source_manifest` supplied by the CLI, not numbers guessed by the Worker. Worker source IDs and file paths identify evidence; do not rely on Worker-generated line numbers. Use targeted local reads to find precise locations. CLI progress and 10-second heartbeat are on stderr; stdout is the Worker answer only.
+
+If one bulk-read input exceeds the worker budget, chunks belonging to the same file may be analyzed concurrently (up to 3). Files do not overlap; the existing per-provider max_concurrency still applies. A 429 response is retried once on the same provider after one second before moving to the next.\n

@@ -55,6 +55,8 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         status = self.__class__.provider_status.get(request["model"], self.__class__.status)
+        if isinstance(status, list):
+            status = status.pop(0)
         data = json.dumps({"choices": [{"message": {"content": self.__class__.answer}}]}, ensure_ascii=False).encode(self.__class__.response_charset)
         self.send_response(status)
         self.send_header("Content-Type", f"application/json; charset={self.__class__.response_charset}")
@@ -342,6 +344,49 @@ class ShuntTests(unittest.TestCase):
         self.assertIn("source_id=", requests[0])
         self.assertTrue(all('start_line=' not in request and 'end_line=' not in request
                             for request in requests))
+
+    def test_one_file_uses_at_most_three_parallel_chunk_requests(self):
+        self.src.write_text("line = 1234\n" * 900, encoding="utf-8")
+        self.update_config(context_tokens=2200, reply_tokens=500)
+        FakeHandler.block_requests = True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = pool.submit(self.run_cli, "bulk-read", "--question", "summarize",
+                                  "--paths", self.src)
+            try:
+                with FakeHandler.started:
+                    self.assertTrue(FakeHandler.started.wait_for(
+                        lambda: FakeHandler.inflight == 3, timeout=10),
+                        f"expected 3 concurrent chunks, got {FakeHandler.inflight}")
+                self.assertEqual(FakeHandler.inflight, 3)
+            finally:
+                FakeHandler.release_requests.set()
+            result = running.result(timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(len(FakeHandler.requests), 3)
+        self.assertIn("Chunk 1/", FakeHandler.requests[-1][1]["messages"][1]["content"])
+
+    def test_parallel_chunks_do_not_cross_file_boundary(self):
+        other = self.cwd / "other.py"
+        self.src.write_text("a = 1\n" * 1200, encoding="utf-8")
+        other.write_text("b = 2\n" * 1200, encoding="utf-8")
+        self.update_config(context_tokens=2200, reply_tokens=500)
+        FakeHandler.block_requests = True
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            running = pool.submit(self.run_cli, "bulk-read", "--question", "summarize",
+                                  "--paths", self.src, other)
+            try:
+                with FakeHandler.started:
+                    self.assertTrue(FakeHandler.started.wait_for(
+                        lambda: FakeHandler.inflight == 3, timeout=10))
+                prompts = [body["messages"][1]["content"] for _, body, _ in FakeHandler.requests]
+                self.assertTrue(all('<file source_id="S1"' in prompt for prompt in prompts))
+                self.assertFalse(any('<file source_id="S2"' in prompt for prompt in prompts))
+            finally:
+                FakeHandler.release_requests.set()
+            result = running.result(timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any('<file source_id="S2"' in body["messages"][1]["content"]
+                            for _, body, _ in FakeHandler.requests))
 
     def test_generate_code_fence_and_create_new_target(self):
         FakeHandler.answer = "```python\nprint(42)\n```"
@@ -684,7 +729,7 @@ class ShuntTests(unittest.TestCase):
         FakeHandler.provider_status = {"A": 429}
         first = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "B"])
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "A", "B"])
         self.assertEqual(self.config_state()["current_model"], 1)
         FakeHandler.requests.clear()
         self.assertEqual(self.run_cli("bulk-read", "--question", "hi", "--paths", self.src).returncode, 0)
@@ -693,6 +738,17 @@ class ShuntTests(unittest.TestCase):
         FakeHandler.provider_status = {"A": 200, "B": 503, "C": 503}
         self.assertEqual(self.run_cli("bulk-read", "--question", "hi", "--paths", self.src).returncode, 0)
         self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["B", "C", "A"])
+        self.assertEqual(self.config_state()["current_model"], 0)
+        self.assertIsNone(self.config_state()["first_failure_at"])
+
+    def test_429_retries_once_on_same_model_and_keeps_pointer_on_success(self):
+        self.multi_config()
+        FakeHandler.provider_status = {"A": [429, 200]}
+        result = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([body["model"] for _, body, _ in FakeHandler.requests], ["A", "A"])
+        self.assertIn("429", result.stderr)
+        self.assertIn("重试一次", result.stderr)
         self.assertEqual(self.config_state()["current_model"], 0)
         self.assertIsNone(self.config_state()["first_failure_at"])
 
@@ -720,7 +776,8 @@ class ShuntTests(unittest.TestCase):
                 FakeHandler.provider_status = {"A": status}
                 p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
                 self.assertEqual(p.returncode, 0, p.stderr)
-                self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "B"])
+                self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests],
+                                 ["A", "A", "B"] if status == 429 else ["A", "B"])
                 self.assertEqual(self.config_state()["current_model"], 1)
         FakeHandler.provider_status = {}
 
