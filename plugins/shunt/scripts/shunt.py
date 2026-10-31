@@ -45,7 +45,9 @@ def read_file(name):
     path = Path(name)
     # Never send common credential containers to a remote worker.
     resolved = path.resolve()
-    if resolved == CONFIG_PATH.resolve():
+    # Old config is never loaded, but may still contain secrets from v0.3.0.
+    legacy_config = Path.home() / ".config" / "codex-shunt" / "config.json"
+    if resolved in (CONFIG_PATH.resolve(), legacy_config.resolve()):
         raise ShuntError(f"refusing Shunt credential config: {name}")
     if any(part.startswith(".env") for part in resolved.parts) or resolved.name in {".npmrc", "id_rsa", "credentials"} or resolved.suffix in {".pem", ".key"}:
         raise ShuntError(f"refusing likely secret file: {name}")
@@ -63,19 +65,25 @@ def payload_bytes(mode, message, max_tokens=None):
         {"role": "system", "content": SYSTEM_PROMPTS[mode]},
         {"role": "user", "content": message},
     ]}
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+    payload["max_tokens"] = output_limit(max_tokens)
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-def request_budget():
-    # shortcut: UTF-8 bytes are a conservative proxy for input tokens; configure
-    # context_tokens for the smallest context window your worker supports.
-    context = positive_number("context_tokens", 8192, int)
-    reserve = positive_number("reply_tokens", 1024, int)
-    if reserve >= context:
+def output_limit(max_tokens=None):
+    maximum = positive_number("reply_tokens", 128000, int)
+    return min(max_tokens, maximum) if max_tokens is not None else maximum
+
+
+def request_budget(max_tokens=None):
+    # shortcut: UTF-8 request bytes overestimate input tokens; use a real
+    # tokenizer only if providers need more efficient large-context packing.
+    context = positive_number("context_tokens", 256000, int)
+    maximum_output = output_limit()
+    if maximum_output >= context:
         raise ShuntError("reply_tokens must be smaller than context_tokens")
-    return min(positive_number("max_payload_bytes", 512000, int), context - reserve)
+    return min(positive_number("max_payload_bytes", 512000, int),
+               positive_number("input_tokens", 256000, int),
+               context - output_limit(max_tokens))
 
 
 def worker_request(mode, message, max_tokens=None):
@@ -85,15 +93,14 @@ def worker_request(mode, message, max_tokens=None):
     url = urllib.parse.urlsplit(base)
     is_local = url.hostname in {"localhost", "127.0.0.1", "::1"}
     if not model:
-        raise ShuntError("set model in ~/.config/codex-shunt/config.json")
+        raise ShuntError("set model in ~/.codex/shunt/config.json")
     if (url.scheme != "https" and not (url.scheme == "http" and is_local) or
             not url.netloc or url.username or url.password or url.query or url.fragment):
         raise ShuntError("api_base must be HTTPS (HTTP only for localhost)")
     if not is_local and not key:
-        raise ShuntError("set api_key in ~/.config/codex-shunt/config.json for a remote worker")
+        raise ShuntError("set api_key in ~/.codex/shunt/config.json for a remote worker")
     timeout = positive_number("timeout_seconds", 90, float)
-    ceiling = (request_budget() if mode == "bulk-reader" else
-               positive_number("max_payload_bytes", 512000, int))
+    ceiling = request_budget(max_tokens)
     payload = payload_bytes(mode, message, max_tokens)
     if len(payload) > ceiling:
         raise ShuntError(f"request {len(payload)} bytes exceeds the worker input budget of {ceiling} bytes")
@@ -181,12 +188,12 @@ def reduce_summaries(question, summaries, budget):
         batch = []
         for summary in summaries:
             candidate = "\n\n".join(batch + [summary])
-            if len(payload_bytes("bulk-reader", prefix + candidate, 512)) > budget:
+            if len(payload_bytes("bulk-reader", prefix + candidate, 512)) > request_budget(512):
                 if not batch:
                     raise ShuntError("worker summary is too large to reduce; increase context_tokens")
                 batches.append(batch)
                 batch = [summary]
-                if len(payload_bytes("bulk-reader", prefix + summary, 512)) > budget:
+                if len(payload_bytes("bulk-reader", prefix + summary, 512)) > request_budget(512):
                     raise ShuntError("worker summary is too large to reduce; increase context_tokens")
             else:
                 batch.append(summary)
@@ -208,7 +215,7 @@ def bulk_read(args):
         print(worker_request("bulk-reader", message))
         return
     chunks = [chunk for path, content in documents
-              for chunk in file_chunks(path, content, args.question, budget)]
+              for chunk in file_chunks(path, content, args.question, request_budget(512))]
     summaries = [f"Chunk {i + 1}/{len(chunks)}:\n" +
                  worker_request("bulk-reader", chunk, max_tokens=512)
                  for i, chunk in enumerate(chunks)]

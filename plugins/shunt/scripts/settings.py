@@ -10,12 +10,13 @@ class ConfigError(Exception):
     pass
 
 
-CONFIG_PATH = Path.home() / ".config" / "codex-shunt" / "config.json"
+CONFIG_PATH = Path.home() / ".codex" / "shunt" / "config.json"
 FIELDS = {
     "api_base": str,
     "model": str,
     "api_key": str,
     "context_tokens": int,
+    "input_tokens": int,
     "reply_tokens": int,
     "max_payload_bytes": int,
     "timeout_seconds": (int, float),

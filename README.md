@@ -22,19 +22,20 @@ codex
 创建本地配置目录：
 
 ```bash
-mkdir -p ~/.config/codex-shunt
-chmod 700 ~/.config/codex-shunt
+mkdir -p ~/.codex/shunt
+chmod 700 ~/.codex/shunt
 ```
 
-新建 `~/.config/codex-shunt/config.json`，填入：
+新建 `~/.codex/shunt/config.json`，填入：
 
 ```json
 {
   "api_base": "https://api.openai.com/v1",
-  "model": "gpt-4o-mini",
+  "model": "your-256k-context-model",
   "api_key": "你的 API Key",
-  "context_tokens": 8192,
-  "reply_tokens": 1024,
+  "context_tokens": 256000,
+  "input_tokens": 256000,
+  "reply_tokens": 128000,
   "max_payload_bytes": 512000,
   "timeout_seconds": 90,
   "min_lines": 350
@@ -46,18 +47,21 @@ chmod 700 ~/.config/codex-shunt
 | `api_base` | 模型 API 地址 |
 | `model` | Worker 模型名称 |
 | `api_key` | API 密钥（本地 Ollama 可留空） |
-| `context_tokens` | 模型上下文预算，默认 8192；分片采用保守字节估算 |
-| `reply_tokens` | 预留回复空间，默认 1024 |
+| `context_tokens` | 模型总窗口，默认 256000 |
+| `input_tokens` | 最大输入上限，默认 256000（还要扣除输出预留） |
+| `reply_tokens` | 最大输出上限，默认 128000 |
 | `max_payload_bytes` | 单次请求大小上限，默认 512000 字节 |
 | `timeout_seconds` | 每次 Worker 请求超时，默认 90 秒 |
 | `min_lines` | Hook 自动拦截完整读取的行数阈值，默认 350 |
 
-仅 `api_base` 和 `model` 必填；其余参数省略时使用默认值。
+**总上下文只有 256000：输入与输出预留之和不能超过总窗口。** 默认长回复预留 128000 时，单次请求的有效输入最多约 128000（按保守字节估算）；分片摘要只预留 512 输出，因此可使用更大的输入片段。
+
+仅 `api_base` 和 `model` 必填；其余参数省略时使用默认值。请填支持 256k 总上下文的模型，否则调低配置。
 
 保存后执行：
 
 ```bash
-chmod 600 ~/.config/codex-shunt/config.json
+chmod 600 ~/.codex/shunt/config.json
 ```
 
 使用 **Ollama**：把 `api_base` 改为 `http://127.0.0.1:11434/v1`、`model` 改为已安装的模型名，`api_key` 设为 `""`。只需配置 JSON，不用 `export`。
@@ -86,7 +90,7 @@ codex
 
 Run `/plugins`, install **Codex Shunt**, and start a new task.
 
-**Configure:** Create `~/.config/codex-shunt/config.json` with the eight options shown above: API address/model/key, context/reply budgets, request size, timeout, and Hook line threshold. Only `api_base` and `model` are required; others have defaults. On macOS/Linux, keep the directory private and `chmod 600` the file. Environment variables are not supported.
+**Configure:** Create `~/.codex/shunt/config.json` with the nine options above: API address/model/key, context/input/output token limits, request size, timeout, and Hook threshold. The 256k total context is shared: a 128k maximum output leaves at most about 128k input for full-length replies. Only `api_base` and `model` are required; others have defaults. On macOS/Linux, keep the directory private and `chmod 600` the file. Environment variables are not supported.
 
 **Use:** Ask Codex to use `shunt-bulk-reader` or `shunt-code-writer`. Remote workers receive selected source files; avoid secrets. Chunk summaries may miss details, and Hooks do not intercept every read.
 

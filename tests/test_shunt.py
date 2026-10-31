@@ -73,14 +73,14 @@ class ShuntTests(unittest.TestCase):
                            "model": "cheap-mock", "api_key": "test-only-key"})
 
     def write_config(self, values, mode=0o600):
-        path = self.cwd / ".config/codex-shunt/config.json"
+        path = self.cwd / ".codex/shunt/config.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(values), encoding="utf-8")
         path.chmod(mode)
         return path
 
     def update_config(self, **values):
-        path = self.cwd / ".config/codex-shunt/config.json"
+        path = self.cwd / ".codex/shunt/config.json"
         data = json.loads(path.read_text())
         data.update(values)
         return self.write_config(data)
@@ -93,7 +93,7 @@ class ShuntTests(unittest.TestCase):
         payload = {"hook_event_name": "PreToolUse", "tool_input": {"command": command},
                    "cwd": str(self.cwd), **extra}
         settings = HOOK_MODULE.setting.__globals__
-        with patch.dict(settings, CONFIG_PATH=self.cwd / ".config/codex-shunt/config.json"):
+        with patch.dict(settings, CONFIG_PATH=self.cwd / ".codex/shunt/config.json"):
             settings["load_config"].cache_clear()
             try:
                 return HOOK_MODULE.decision(payload)
@@ -125,7 +125,7 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(FakeHandler.requests[0][2], "Bearer config-key")
 
     def test_missing_config_fails_instead_of_using_environment(self):
-        (self.cwd / ".config/codex-shunt/config.json").unlink()
+        (self.cwd / ".codex/shunt/config.json").unlink()
         env = dict(self.env, SHUNT_API_BASE=f"http://127.0.0.1:{self.server.server_port}/v1",
                    SHUNT_MODEL="cheap-mock", SHUNT_API_KEY="key")
         p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
@@ -133,7 +133,7 @@ class ShuntTests(unittest.TestCase):
         self.assertFalse(FakeHandler.requests)
 
     def test_missing_config_does_not_block_hook(self):
-        (self.cwd / ".config/codex-shunt/config.json").unlink()
+        (self.cwd / ".codex/shunt/config.json").unlink()
         big = self.cwd / "big.py"
         big.write_text("x\n" * 500)
         event = {"tool_input": {"command": "cat big.py"}, "cwd": str(self.cwd)}
@@ -159,7 +159,7 @@ class ShuntTests(unittest.TestCase):
     def test_config_rejects_symlinks_unknown_fields_and_wrong_types(self):
         target = self.cwd / "secret.json"
         target.write_text('{"api_key":"test"}')
-        config = self.cwd / ".config/codex-shunt/config.json"
+        config = self.cwd / ".codex/shunt/config.json"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.unlink()
         config.symlink_to(target)
@@ -224,12 +224,51 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(target.read_text(), "DO NOT REPLACE")
         self.assertEqual(len(FakeHandler.requests), 0)
 
-    def test_code_writer_keeps_previous_payload_cap(self):
-        # Bulk-read context-budgeting must not break code-write callers.
-        self.src.write_text("reference\n" * 2000)
+    def test_code_writer_reserves_output_inside_shared_context(self):
+        self.update_config(context_tokens=1800, reply_tokens=800)
+        self.src.write_text("reference\n" * 200)
         p = self.run_cli("code-write", "--spec", "write tests", "--reference", self.src)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("worker input budget", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_defaults_share_256k_context_between_256k_input_and_128k_output(self):
+        self.src.write_text("line\n" * 27000, encoding="utf-8")
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(len(FakeHandler.requests), 1)
+        bodies = [body for _, body, _ in FakeHandler.requests]
+        self.assertGreater(len(bodies), 1)
+        self.assertEqual(bodies[0]["max_tokens"], 512)
+        self.assertEqual(bodies[-1]["max_tokens"], 128000)
+        for body in bodies:
+            size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+            self.assertLessEqual(size + body["max_tokens"], 256000)
+            self.assertLessEqual(size, 256000)
+
+    def test_input_limit_is_independent_of_transport_and_context(self):
+        self.update_config(input_tokens=1024, context_tokens=256000, reply_tokens=128000)
+        self.src.write_text("line\n" * 1500, encoding="utf-8")
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertGreater(len(FakeHandler.requests), 5)
+        for _, body, _ in FakeHandler.requests:
+            self.assertLessEqual(len(json.dumps(body, ensure_ascii=False).encode()), 1024)
+
+    def test_legacy_config_is_not_loaded_or_delegated(self):
+        legacy = self.cwd / ".config/codex-shunt/config.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(json.dumps({"api_base": "http://127.0.0.1:1/v1",
+                                      "model": "old-model", "api_key": "old-secret"}))
+        current = self.cwd / ".codex/shunt/config.json"
+        current.unlink()
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("config not found", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+        self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
+                           "model": "configured-cheap", "api_key": "test-only-key"})
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", legacy)
+        self.assertIn("refusing Shunt credential config", p.stderr)
+        self.assertFalse(FakeHandler.requests)
 
     def test_unreadable_input_is_error_not_fake_context(self):
         p = self.run_cli("bulk-read", "--question", "hi", "--paths", "missing.py")
