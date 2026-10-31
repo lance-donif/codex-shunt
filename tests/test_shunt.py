@@ -67,8 +67,23 @@ class ShuntTests(unittest.TestCase):
         FakeHandler.answer = "output"
         FakeHandler.status = 200
         FakeHandler.redirect = None
-        self.env = dict(os.environ, SHUNT_API_BASE=f"http://127.0.0.1:{self.server.server_port}/v1",
-                        SHUNT_MODEL="cheap-mock", SHUNT_API_KEY="test-only-key")
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("SHUNT_")}
+        self.env["HOME"] = str(self.cwd)
+        self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
+                           "model": "cheap-mock", "api_key": "test-only-key"})
+
+    def write_config(self, values, mode=0o600):
+        path = self.cwd / ".config/codex-shunt/config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(values), encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def update_config(self, **values):
+        path = self.cwd / ".config/codex-shunt/config.json"
+        data = json.loads(path.read_text())
+        data.update(values)
+        return self.write_config(data)
 
     def run_cli(self, *args, env=None):
         return subprocess.run([sys.executable, str(CLI), *map(str, args)], cwd=self.cwd,
@@ -77,7 +92,106 @@ class ShuntTests(unittest.TestCase):
     def hook(self, command, **extra):
         payload = {"hook_event_name": "PreToolUse", "tool_input": {"command": command},
                    "cwd": str(self.cwd), **extra}
-        return HOOK_MODULE.decision(payload)
+        settings = HOOK_MODULE.setting.__globals__
+        with patch.dict(settings, CONFIG_PATH=self.cwd / ".config/codex-shunt/config.json"):
+            settings["load_config"].cache_clear()
+            try:
+                return HOOK_MODULE.decision(payload)
+            finally:
+                settings["load_config"].cache_clear()
+
+    def test_user_config_works_without_exports_for_both_commands(self):
+        self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
+                           "model": "configured-cheap", "api_key": "config-test-key",
+                           "context_tokens": 3000, "reply_tokens": 500})
+        env = self.env
+        p = self.run_cli("bulk-read", "--question", "Describe", "--paths", self.src, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(FakeHandler.requests[0][1]["model"], "configured-cheap")
+        self.assertEqual(FakeHandler.requests[0][2], "Bearer config-test-key")
+        target = self.cwd / "generated.py"
+        p = self.run_cli("code-write", "--spec", "Make test", "--reference", self.src,
+                         "--target", target, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(target.exists())
+
+    def test_environment_variables_do_not_override_config(self):
+        self.update_config(model="config-model", api_key="config-key")
+        env = dict(self.env, SHUNT_MODEL="env-model", SHUNT_API_KEY="override-key",
+                   SHUNT_API_BASE="http://invalid.example/v1", SHUNT_MAX_PAYLOAD_BYTES="16")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(FakeHandler.requests[0][1]["model"], "config-model")
+        self.assertEqual(FakeHandler.requests[0][2], "Bearer config-key")
+
+    def test_missing_config_fails_instead_of_using_environment(self):
+        (self.cwd / ".config/codex-shunt/config.json").unlink()
+        env = dict(self.env, SHUNT_API_BASE=f"http://127.0.0.1:{self.server.server_port}/v1",
+                   SHUNT_MODEL="cheap-mock", SHUNT_API_KEY="key")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.assertIn("config not found", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_missing_config_does_not_block_hook(self):
+        (self.cwd / ".config/codex-shunt/config.json").unlink()
+        big = self.cwd / "big.py"
+        big.write_text("x\n" * 500)
+        event = {"tool_input": {"command": "cat big.py"}, "cwd": str(self.cwd)}
+        p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event),
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout), {})
+
+    def test_config_rejects_insecure_permissions_and_malformed_json(self):
+        config = self.write_config({"model": "example"}, mode=0o644)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src,
+                         env=self.env)
+        if os.name != "nt":
+            self.assertIn("chmod 600", p.stderr)
+            self.assertFalse(FakeHandler.requests)
+        config.chmod(0o600)
+        config.write_text("{bad-json", encoding="utf-8")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src,
+                         env=self.env)
+        self.assertIn("valid JSON", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_config_rejects_symlinks_unknown_fields_and_wrong_types(self):
+        target = self.cwd / "secret.json"
+        target.write_text('{"api_key":"test"}')
+        config = self.cwd / ".config/codex-shunt/config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.unlink()
+        config.symlink_to(target)
+        env = self.env
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.assertIn("not a symlink", p.stderr)
+        config.unlink()
+        self.write_config({"unknown": "ignored"})
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.assertIn("unknown config field", p.stderr)
+        self.write_config({"context_tokens": True})
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.assertIn("invalid config type", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_shunt_config_file_cannot_be_delegated(self):
+        path = self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
+                                  "model": "config-model", "api_key": "secret-key"})
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", path,
+                         env=self.env)
+        self.assertIn("refusing Shunt credential config", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_hook_uses_user_config_without_exports(self):
+        big = self.cwd / "medium.py"
+        big.write_text("code\n" * 220)
+        self.write_config({"min_lines": 200})
+        event = {"tool_input": {"command": "cat medium.py"}, "cwd": str(self.cwd)}
+        p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event),
+                           text=True, capture_output=True, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_bulk_reads_selected_files_and_extracts_only_worker_answer(self):
         p = self.run_cli("bulk-read", "--question", "What returns?", "--paths", self.src)
@@ -139,19 +253,19 @@ class ShuntTests(unittest.TestCase):
         self.assertFalse(FakeHandler.requests)
 
     def test_bounded_request(self):
-        env = dict(self.env, SHUNT_MAX_PAYLOAD_BYTES="16")
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.update_config(max_payload_bytes=16)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("too small", p.stderr)
         self.assertFalse(FakeHandler.requests)
 
     def test_reject_remote_http_and_missing_credentials(self):
-        env = dict(self.env, SHUNT_API_BASE="http://example.org/v1")
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.update_config(api_base="http://example.org/v1")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertIn("HTTPS", p.stderr)
-        env = dict(self.env, SHUNT_API_BASE="https://example.org/v1", SHUNT_API_KEY="")
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
-        self.assertIn("SHUNT_API_KEY", p.stderr)
+        self.update_config(api_base="https://example.org/v1", api_key="")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("api_key", p.stderr)
         self.assertFalse(FakeHandler.requests)
 
     def test_worker_http_failure_does_not_create_target(self):
@@ -169,8 +283,8 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(len(FakeHandler.requests), 1)
 
     def test_loopback_without_key_is_valid(self):
-        env = dict(self.env, SHUNT_API_KEY="")
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src, env=env)
+        self.update_config(api_key="")
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIsNone(FakeHandler.requests[0][2])
 
@@ -188,18 +302,18 @@ class ShuntTests(unittest.TestCase):
         big = self.cwd / "medium.txt"
         big.write_text("line\n" * 201)
         self.assertEqual(self.hook("cat medium.txt"), {})
-        env = dict(self.env, SHUNT_MIN_LINES="200")
+        self.update_config(min_lines=200)
         payload = {"tool_input": {"command": "cat medium.txt"}, "cwd": str(self.cwd)}
         p = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload),
-                           text=True, capture_output=True, env=env)
+                           text=True, capture_output=True, env=self.env)
         self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_large_file_is_chunked_and_reduced_without_losing_source_text(self):
         import re
         source = ("# 中文\n" + "result = 'hello\\\"world'\n" * 300 + "final = 7\n")
         self.src.write_text(source, encoding="utf-8")
-        env = dict(self.env, SHUNT_CONTEXT_TOKENS="2100", SHUNT_REPLY_TOKENS="500")
-        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src, env=env)
+        self.update_config(context_tokens=2100, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.strip(), "output")
         requests = [body for _, body, _ in FakeHandler.requests]
@@ -216,8 +330,8 @@ class ShuntTests(unittest.TestCase):
         import re
         source = "你好 🔧\\" * 3500  # includes non-ASCII, backslashes and JSON-escaped quotes
         self.src.write_text(source, encoding="utf-8")
-        env = dict(self.env, SHUNT_CONTEXT_TOKENS="2300", SHUNT_REPLY_TOKENS="500")
-        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src, env=env)
+        self.update_config(context_tokens=2300, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         chunks = [body["messages"][1]["content"] for _, body, _ in FakeHandler.requests
                   if 'start_line=' in body["messages"][1]["content"]]
@@ -228,8 +342,8 @@ class ShuntTests(unittest.TestCase):
     def test_many_chunks_use_bounded_multilevel_reduction(self):
         self.src.write_text("line = 1234\n" * 1500)
         FakeHandler.answer = "summary " * 45
-        env = dict(self.env, SHUNT_CONTEXT_TOKENS="2000", SHUNT_REPLY_TOKENS="500")
-        p = self.run_cli("bulk-read", "--question", "find all", "--paths", self.src, env=env)
+        self.update_config(context_tokens=2000, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "find all", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         calls = [body for _, body, _ in FakeHandler.requests]
         self.assertGreater(len(calls), 15)
@@ -247,15 +361,15 @@ class ShuntTests(unittest.TestCase):
         big = self.cwd / "big.py"
         big.write_text("line\n" * 400)
         FakeHandler.status = 400
-        env = dict(self.env, SHUNT_CONTEXT_TOKENS="2100", SHUNT_REPLY_TOKENS="500")
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", big, env=env)
+        self.update_config(context_tokens=2100, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", big)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(p.stdout, "")
         self.assertIn("HTTP 400", p.stderr)
 
     def test_context_budget_rejects_invalid_reserve(self):
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src,
-                         env=dict(self.env, SHUNT_CONTEXT_TOKENS="500", SHUNT_REPLY_TOKENS="500"))
+        self.update_config(context_tokens=500, reply_tokens=500)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("smaller", p.stderr)
         self.assertFalse(FakeHandler.requests)

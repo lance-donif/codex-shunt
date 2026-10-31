@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env*
+
+# Never commit worker credentials
+config.json

@@ -1,0 +1,10 @@
+{
+  "api_base": "https://api.openai.com/v1",
+  "model": "gpt-4o-mini",
+  "api_key": "REPLACE_WITH_YOUR_API_KEY",
+  "context_tokens": 8192,
+  "reply_tokens": 1024,
+  "max_payload_bytes": 512000,
+  "timeout_seconds": 90,
+  "min_lines": 350
+}

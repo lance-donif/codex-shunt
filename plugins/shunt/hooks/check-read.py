@@ -9,6 +9,9 @@ import re
 import shlex
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from settings import ConfigError, setting
+
 
 def python_read(argv):
     """Recognize only side-effect-free, literal `python -c 'print(file.read())'` reads."""
@@ -111,10 +114,12 @@ def read_paths(argv, limit):
 
 def decision(event):
     try:
-        limit = int(os.environ.get("SHUNT_MIN_LINES", "350"))
+        limit = int(setting("min_lines", 350))
         if limit < 1:
             raise ValueError()
-    except ValueError:
+    except ConfigError:
+        return {}  # Misconfigured plugin must not block normal Codex reads.
+    except (ValueError, TypeError):
         limit = 350
     tool_input = event.get("tool_input") or {}
     command = tool_input.get("command") or tool_input.get("cmd") or ""
