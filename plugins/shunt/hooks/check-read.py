@@ -10,7 +10,7 @@ import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from settings import ConfigError, setting
+from settings import ConfigError, load_config, paused, setting
 
 
 def python_read(argv):
@@ -114,6 +114,9 @@ def read_paths(argv, limit):
 
 def decision(event):
     try:
+        # A disabled Worker must not prevent Codex from reading source files.
+        if paused(load_config()):
+            return {}
         limit = int(setting("min_lines", 350))
         if limit < 1:
             raise ValueError()

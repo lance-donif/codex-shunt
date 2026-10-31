@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone, timedelta
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -24,17 +26,20 @@ class FakeHandler(BaseHTTPRequestHandler):
     answer = "output"
     status = 200
     redirect = None
+    provider_status = {}
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        self.__class__.requests.append((self.path, json.loads(body), self.headers.get("Authorization")))
+        request = json.loads(body)
+        self.__class__.requests.append((self.path, request, self.headers.get("Authorization")))
         if self.__class__.redirect:
             self.send_response(307)
             self.send_header("Location", self.__class__.redirect)
             self.end_headers()
             return
+        status = self.__class__.provider_status.get(request["model"], self.__class__.status)
         data = json.dumps({"choices": [{"message": {"content": self.__class__.answer}}]}).encode()
-        self.send_response(self.__class__.status)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -67,6 +72,7 @@ class ShuntTests(unittest.TestCase):
         FakeHandler.answer = "output"
         FakeHandler.status = 200
         FakeHandler.redirect = None
+        FakeHandler.provider_status = {}
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("SHUNT_")}
         self.env["HOME"] = str(self.cwd)
         self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
@@ -175,6 +181,22 @@ class ShuntTests(unittest.TestCase):
         self.assertIn("invalid config type", p.stderr)
         self.assertFalse(FakeHandler.requests)
 
+    def test_legacy_config_is_not_loaded_or_delegated(self):
+        legacy = self.cwd / ".config/codex-shunt/config.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text(json.dumps({"api_base": "http://127.0.0.1:1/v1",
+                                      "model": "old-model", "api_key": "old-secret"}))
+        current = self.cwd / ".codex/shunt/config.json"
+        current.unlink()
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("config not found", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+        self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
+                           "model": "configured-cheap", "api_key": "test-only-key"})
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", legacy)
+        self.assertIn("refusing Shunt credential config", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
     def test_shunt_config_file_cannot_be_delegated(self):
         path = self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
                                   "model": "config-model", "api_key": "secret-key"})
@@ -238,10 +260,11 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         bodies = [body for _, body, _ in FakeHandler.requests]
         self.assertGreater(len(bodies), 1)
-        self.assertEqual(bodies[0]["max_tokens"], 512)
+        self.assertEqual(bodies[0]["max_tokens"], 512)  # chunk output, not 128k
         self.assertEqual(bodies[-1]["max_tokens"], 128000)
         for body in bodies:
             size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+            # Safe UTF-8 byte estimate: input plus requested output fits context.
             self.assertLessEqual(size + body["max_tokens"], 256000)
             self.assertLessEqual(size, 256000)
 
@@ -253,22 +276,6 @@ class ShuntTests(unittest.TestCase):
         self.assertGreater(len(FakeHandler.requests), 5)
         for _, body, _ in FakeHandler.requests:
             self.assertLessEqual(len(json.dumps(body, ensure_ascii=False).encode()), 1024)
-
-    def test_legacy_config_is_not_loaded_or_delegated(self):
-        legacy = self.cwd / ".config/codex-shunt/config.json"
-        legacy.parent.mkdir(parents=True)
-        legacy.write_text(json.dumps({"api_base": "http://127.0.0.1:1/v1",
-                                      "model": "old-model", "api_key": "old-secret"}))
-        current = self.cwd / ".codex/shunt/config.json"
-        current.unlink()
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
-        self.assertIn("config not found", p.stderr)
-        self.assertFalse(FakeHandler.requests)
-        self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
-                           "model": "configured-cheap", "api_key": "test-only-key"})
-        p = self.run_cli("bulk-read", "--question", "hi", "--paths", legacy)
-        self.assertIn("refusing Shunt credential config", p.stderr)
-        self.assertFalse(FakeHandler.requests)
 
     def test_unreadable_input_is_error_not_fake_context(self):
         p = self.run_cli("bulk-read", "--question", "hi", "--paths", "missing.py")
@@ -437,6 +444,144 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(self.hook("", tool_input={"cmd": ["bash", "-lc", "cat big.py"]})
                          ["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.hook("cat big.py && echo side-effect"), {})
+
+    def multi_config(self, **extras):
+        base = f"http://127.0.0.1:{self.server.server_port}/v1"
+        data = {
+            "models": [{"name": name, "api_base": base, "model": name,
+                        "api_key": "key-" + name} for name in ("A", "B", "C")],
+            "current_model": 0, "first_failure_at": None, "second_failure_at": None,
+            "context_tokens": 256000, "input_tokens": 256000,
+            "reply_tokens": 128000, "timeout_seconds": 300,
+        }
+        data.update(extras)
+        self.write_config(data)
+
+    def config_state(self):
+        return json.loads((self.cwd / ".codex/shunt/config.json").read_text())
+
+    def test_multi_model_pointer_sticks_on_success_and_cycles_after_failure(self):
+        self.multi_config()
+        FakeHandler.provider_status = {"A": 429}
+        first = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "B"])
+        self.assertEqual(self.config_state()["current_model"], 1)
+        FakeHandler.requests.clear()
+        self.assertEqual(self.run_cli("bulk-read", "--question", "hi", "--paths", self.src).returncode, 0)
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["B"])
+        FakeHandler.requests.clear()
+        FakeHandler.provider_status = {"A": 200, "B": 503, "C": 503}
+        self.assertEqual(self.run_cli("bulk-read", "--question", "hi", "--paths", self.src).returncode, 0)
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["B", "C", "A"])
+        self.assertEqual(self.config_state()["current_model"], 0)
+        self.assertIsNone(self.config_state()["first_failure_at"])
+
+    def test_first_full_failure_cools_for_thirty_minutes_and_second_disables(self):
+        self.multi_config()
+        FakeHandler.status = 503
+        first = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("paused for 30 minutes", first.stderr)
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "B", "C"])
+        state = self.config_state()
+        self.assertEqual(state["current_model"], 0)
+        self.assertIsNotNone(state["first_failure_at"])
+        self.assertIsNone(state["second_failure_at"])
+        self.assertLess(abs((datetime.now(timezone.utc) - datetime.fromisoformat(state["first_failure_at"])).total_seconds()), 10)
+        FakeHandler.requests.clear()
+        second = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("cooling down", second.stderr)
+        self.assertFalse(FakeHandler.requests)
+        big = self.cwd / "large.py"
+        big.write_text("x\n" * 400)
+        self.assertEqual(self.hook("cat large.py"), {})
+        self.update_config(first_failure_at=(datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat())
+        third = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("permanently disabled", third.stderr)
+        self.assertEqual(len(FakeHandler.requests), 3)
+        self.assertIsNotNone(self.config_state()["second_failure_at"])
+        FakeHandler.requests.clear()
+        fourth = self.run_cli("code-write", "--spec", "hi", "--reference", self.src)
+        self.assertIn("permanently disabled", fourth.stderr)
+        self.assertFalse(FakeHandler.requests)
+        self.assertEqual(self.hook("cat large.py"), {})
+        self.update_config(first_failure_at=None, second_failure_at=None)
+        FakeHandler.status = 200
+        recovered = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A"])
+
+    def test_success_after_cooldown_resets_failure_history(self):
+        self.multi_config(first_failure_at=(datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat())
+        FakeHandler.provider_status = {"A": 401}
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        state = self.config_state()
+        self.assertEqual(state["current_model"], 1)
+        self.assertIsNone(state["first_failure_at"])
+        self.assertIsNone(state["second_failure_at"])
+
+    def test_reasoning_field_token_name_limits_and_smaller_fallback_budget(self):
+        self.multi_config()
+        data = self.config_state()
+        data["models"][0].update(reasoning_effort="high", token_field="max_completion_tokens")
+        data["models"][1].update(context_tokens=2600, input_tokens=2100, reply_tokens=500)
+        self.write_config(data)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        first = FakeHandler.requests[0][1]
+        self.assertEqual(first["reasoning_effort"], "high")
+        self.assertEqual(first["max_completion_tokens"], 128000)
+        self.assertNotIn("max_tokens", first)
+        self.assertLessEqual(len(json.dumps(first, ensure_ascii=False).encode()), 2100)
+        # The other provider has a much smaller window: all source chunks must fit it.
+        FakeHandler.requests.clear()
+        self.src.write_text("test line\n" * 500)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertGreater(len(FakeHandler.requests), 2)
+        for _, body, _ in FakeHandler.requests:
+            self.assertLessEqual(len(json.dumps(body, ensure_ascii=False).encode()), 2100)
+
+    def test_bad_model_configuration_rejected_before_network_or_state_change(self):
+        self.multi_config()
+        data = self.config_state()
+        data["models"][1]["api_base"] = "http://invalid.example/v1"
+        self.write_config(data)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("HTTPS", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+        self.assertEqual(self.config_state()["current_model"], 0)
+        self.assertIsNone(self.config_state()["first_failure_at"])
+        data["models"][1]["api_base"] = data["models"][0]["api_base"]
+        data["models"][1]["token_field"] = "unsupported"
+        self.write_config(data)
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertIn("token_field", p.stderr)
+        self.assertFalse(FakeHandler.requests)
+
+    def test_parallel_processes_do_not_duplicate_full_outage_or_corrupt_config(self):
+        self.multi_config()
+        FakeHandler.status = 503
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.run_cli, "bulk-read", "--question", "hi", "--paths", self.src)
+                       for _ in range(2)]
+            results = [f.result(timeout=30) for f in futures]
+        self.assertTrue(all(result.returncode != 0 for result in results))
+        self.assertEqual(len(FakeHandler.requests), 3)  # Second process sees the cooldown.
+        self.assertIsNotNone(self.config_state()["first_failure_at"])
+        self.assertIsNone(self.config_state()["second_failure_at"])
+
+    def test_api_key_and_private_permissions_survive_atomic_state_updates(self):
+        self.multi_config()
+        FakeHandler.provider_status = {"A": 429}
+        p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = self.config_state()
+        self.assertEqual(data["models"][0]["api_key"], "key-A")
+        if os.name != "nt":
+            self.assertEqual((self.cwd / ".codex/shunt/config.json").stat().st_mode & 0o777, 0o600)
 
     def test_portable_manifest_and_skills(self):
         plugin = ROOT / "plugins/shunt"

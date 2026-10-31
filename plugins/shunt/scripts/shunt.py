@@ -10,8 +10,10 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from xml.sax.saxutils import quoteattr
-from settings import CONFIG_PATH, ConfigError, setting
+from settings import (CONFIG_PATH, ConfigError, config_lock, load_config, paused, profiles,
+                      setting, update_state)
 
 SYSTEM_PROMPTS = {
     "bulk-reader": (
@@ -45,7 +47,7 @@ def read_file(name):
     path = Path(name)
     # Never send common credential containers to a remote worker.
     resolved = path.resolve()
-    # Old config is never loaded, but may still contain secrets from v0.3.0.
+    # Old config is never loaded but may still contain a credential from v0.3.0.
     legacy_config = Path.home() / ".config" / "codex-shunt" / "config.json"
     if resolved in (CONFIG_PATH.resolve(), legacy_config.resolve()):
         raise ShuntError(f"refusing Shunt credential config: {name}")
@@ -60,75 +62,137 @@ def read_file(name):
     return text
 
 
-def payload_bytes(mode, message, max_tokens=None):
-    payload = {"model": setting("model"), "messages": [
-        {"role": "system", "content": SYSTEM_PROMPTS[mode]},
-        {"role": "user", "content": message},
-    ]}
-    payload["max_tokens"] = output_limit(max_tokens)
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+class WorkerFailure(ShuntError):
+    pass
 
 
-def output_limit(max_tokens=None):
-    maximum = positive_number("reply_tokens", 128000, int)
+def model_number(model, name, default, parse=int):
+    raw = model.get(name, setting(name, default))
+    try:
+        n = parse(raw)
+        if not 0 < n < 10**9:
+            raise ValueError
+        return n
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ShuntError(f"{model['name']}: {name} must be a positive number") from exc
+
+
+def output_limit(model, max_tokens=None):
+    maximum = model_number(model, "reply_tokens", 128000)
     return min(max_tokens, maximum) if max_tokens is not None else maximum
 
 
+def payload_bytes(mode, message, max_tokens=None, model=None):
+    """Estimate the largest provider request when no particular model is selected."""
+    if model is None:
+        return max((payload_bytes(mode, message, max_tokens, p) for p in profiles()), key=len)
+    payload = {"model": model["model"], "messages": [
+        {"role": "system", "content": SYSTEM_PROMPTS[mode]},
+        {"role": "user", "content": message},
+    ]}
+    payload[model.get("token_field", "max_tokens")] = output_limit(model, max_tokens)
+    if "reasoning_effort" in model:
+        payload["reasoning_effort"] = model["reasoning_effort"]
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def request_budget(max_tokens=None):
-    # shortcut: UTF-8 request bytes overestimate input tokens; use a real
-    # tokenizer only if providers need more efficient large-context packing.
-    context = positive_number("context_tokens", 256000, int)
-    maximum_output = output_limit()
-    if maximum_output >= context:
-        raise ShuntError("reply_tokens must be smaller than context_tokens")
-    return min(positive_number("max_payload_bytes", 512000, int),
-               positive_number("input_tokens", 256000, int),
-               context - output_limit(max_tokens))
+    # shortcut: UTF-8 bytes conservatively approximate input tokens, not exact tokenization.
+    # A fallback always fits because every provider's limits participate in the minimum.
+    budgets = []
+    transport = positive_number("max_payload_bytes", 512000, int)
+    for model in profiles():
+        context = model_number(model, "context_tokens", 256000)
+        reserve = model_number(model, "reply_tokens", 128000)
+        if reserve >= context:
+            raise ShuntError(f"{model['name']}: reply_tokens must be smaller than context_tokens")
+        budgets.append(min(transport, model_number(model, "input_tokens", 256000),
+                           context - output_limit(model, max_tokens)))
+    return min(budgets)
 
 
-def worker_request(mode, message, max_tokens=None):
-    base = setting("api_base").rstrip("/")
-    model = setting("model")
-    key = setting("api_key")
-    url = urllib.parse.urlsplit(base)
-    is_local = url.hostname in {"localhost", "127.0.0.1", "::1"}
-    if not model:
-        raise ShuntError("set model in ~/.codex/shunt/config.json")
-    if (url.scheme != "https" and not (url.scheme == "http" and is_local) or
-            not url.netloc or url.username or url.password or url.query or url.fragment):
-        raise ShuntError("api_base must be HTTPS (HTTP only for localhost)")
-    if not is_local and not key:
-        raise ShuntError("set api_key in ~/.codex/shunt/config.json for a remote worker")
-    timeout = positive_number("timeout_seconds", 90, float)
-    ceiling = request_budget(max_tokens)
-    payload = payload_bytes(mode, message, max_tokens)
-    if len(payload) > ceiling:
-        raise ShuntError(f"request {len(payload)} bytes exceeds the worker input budget of {ceiling} bytes")
+def validate_models():
+    for model in profiles():
+        base = model.get("api_base", "").rstrip("/")
+        if not model.get("model"):
+            raise ShuntError(f"{model['name']}: set model in ~/.codex/shunt/config.json")
+        url = urllib.parse.urlsplit(base)
+        is_local = url.hostname in {"localhost", "127.0.0.1", "::1"}
+        if (url.scheme != "https" and not (url.scheme == "http" and is_local) or
+                not url.netloc or url.username or url.password or url.query or url.fragment):
+            raise ShuntError(f"{model['name']}: api_base must be HTTPS (HTTP only for localhost)")
+        if not is_local and not model.get("api_key", ""):
+            raise ShuntError(f"{model['name']}: set api_key in ~/.codex/shunt/config.json")
+        model_number(model, "timeout_seconds", 300, float)
+    request_budget()
+
+
+def call_model(model, mode, message, max_tokens=None):
+    payload = payload_bytes(mode, message, max_tokens, model)
+    base = model["api_base"].rstrip("/")
     headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    if model.get("api_key"):
+        headers["Authorization"] = f"Bearer {model['api_key']}"
 
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None  # Never forward bearer tokens or source code to a redirected host.
+            return None  # Never forward credentials or source code to a redirected host.
 
     req = urllib.request.Request(base + "/chat/completions", data=payload, headers=headers, method="POST")
     try:
-        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as result:
+        with urllib.request.build_opener(NoRedirect).open(
+                req, timeout=model_number(model, "timeout_seconds", 300, float)) as result:
             data = json.load(result)
     except urllib.error.HTTPError as exc:
-        raise ShuntError(f"worker HTTP {exc.code} (check endpoint, model and credentials)") from exc
+        raise WorkerFailure(f"HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ShuntError(f"worker connection failed: {exc}") from exc
+        raise WorkerFailure(f"connection failed: {exc}") from exc
     except (ValueError, UnicodeError) as exc:
-        raise ShuntError("worker returned malformed JSON") from exc
+        raise WorkerFailure("malformed worker JSON") from exc
     try:
         answer = data["choices"][0]["message"]["content"]
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("empty answer")
         return answer
     except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise ShuntError("worker returned no usable choices[0].message.content") from exc
+        raise WorkerFailure("no usable choices[0].message.content") from exc
+
+
+def worker_request(mode, message, max_tokens=None):
+    with config_lock():
+        load_config.cache_clear()
+        config = load_config()
+        if paused(config):
+            status = "permanently disabled; clear both failure timestamps" if config.get("second_failure_at") else "cooling down for 30 minutes"
+            raise ShuntError(f"all workers unavailable: {status} in ~/.codex/shunt/config.json")
+        # Recheck under the lock: another task may have moved the pointer or edited limits.
+        models = profiles()
+        validate_models()
+        budget = request_budget(max_tokens)
+        if len(payload_bytes(mode, message, max_tokens)) > budget:
+            raise ShuntError(f"request exceeds the worker input budget of {budget} bytes")
+        start = config.get("current_model", 0)
+        errors = []
+        for offset in range(len(models)):
+            index = (start + offset) % len(models)
+            model = models[index]
+            try:
+                answer = call_model(model, mode, message, max_tokens)
+            except WorkerFailure as exc:
+                errors.append(f"{model['name']}: {exc}")
+                update_state(current_model=(index + 1) % len(models))
+            else:
+                if index != start or config.get("first_failure_at") or config.get("second_failure_at"):
+                    update_state(current_model=index, first_failure_at=None, second_failure_at=None)
+                return answer
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if config.get("first_failure_at"):
+            update_state(second_failure_at=timestamp)
+            state = "permanently disabled; clear first_failure_at and second_failure_at to reset"
+        else:
+            update_state(first_failure_at=timestamp)
+            state = "paused for 30 minutes"
+        raise ShuntError("all models failed (" + "; ".join(errors) + "); " + state)
 
 
 def file_message(path, start, content, question):

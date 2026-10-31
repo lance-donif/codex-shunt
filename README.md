@@ -4,95 +4,87 @@
 
 ## 简体中文
 
-**让 Codex 把大文件分析、重复代码生成交给更便宜的 AI 模型。** 支持 OpenAI 兼容接口和 Ollama，不需要 Spotify Portal。
+让 Codex 把**大文件阅读、重复代码生成**交给成本更低的 AI Worker。支持多个厂家、自动故障转移和 Ollama，无需 Spotify Portal。要求 **Codex CLI + Python 3.9+**。
 
-要求：Codex CLI、Python 3.9+。
-
-### 1. 安装（无需下载项目）
+### 1. 安装
 
 ```bash
 codex plugin marketplace add lance-donif/codex-shunt
 codex
 ```
 
-进入 Codex 后输入 `/plugins`，找到 **Codex Shunt** 并安装，随后开启新任务。
+在 Codex 里输入 `/plugins`，安装 **Codex Shunt**，然后开启新任务。
 
-### 2. 配置模型
+### 2. 配置
 
-创建本地配置目录：
+先创建私有配置目录：
 
 ```bash
 mkdir -p ~/.codex/shunt
 chmod 700 ~/.codex/shunt
 ```
 
-新建 `~/.codex/shunt/config.json`，填入：
+然后新建 `~/.codex/shunt/config.json`（**不是** Codex 的 `config.toml`）。参考仓库的 [config.example.json](config.example.json)，配置格式如下：
 
 ```json
 {
-  "api_base": "https://api.openai.com/v1",
-  "model": "your-256k-context-model",
-  "api_key": "你的 API Key",
+  "models": [
+    {"name": "A", "api_base": "https://provider-a.example/v1", "model": "model-a", "api_key": "KEY_A"},
+    {"name": "B", "api_base": "https://provider-b.example/v1", "model": "model-b", "api_key": "KEY_B"},
+    {"name": "C", "api_base": "https://provider-c.example/v1", "model": "model-c", "api_key": "KEY_C"}
+  ],
+  "current_model": 0,
+  "first_failure_at": null,
+  "second_failure_at": null,
   "context_tokens": 256000,
   "input_tokens": 256000,
   "reply_tokens": 128000,
   "max_payload_bytes": 512000,
-  "timeout_seconds": 90,
+  "timeout_seconds": 300,
   "min_lines": 350
 }
 ```
 
-| 参数 | 作用 |
+将厂家地址、模型名和密钥替换成真实值。**模型按数组顺序 A → B → C → A 循环**；成功后保持当前模型，失败才切换。每次最多尝试每个模型一次。
+
+| 参数 | 用途 |
 | --- | --- |
-| `api_base` | 模型 API 地址 |
-| `model` | Worker 模型名称 |
-| `api_key` | API 密钥（本地 Ollama 可留空） |
-| `context_tokens` | 模型总窗口，默认 256000 |
-| `input_tokens` | 最大输入上限，默认 256000（还要扣除输出预留） |
-| `reply_tokens` | 最大输出上限，默认 128000 |
-| `max_payload_bytes` | 单次请求大小上限，默认 512000 字节 |
-| `timeout_seconds` | 每次 Worker 请求超时，默认 90 秒 |
-| `min_lines` | Hook 自动拦截完整读取的行数阈值，默认 350 |
+| `current_model` | 当前模型下标：`0` 为 A、`1` 为 B、`2` 为 C；插件自动保存 |
+| `first_failure_at` | 全部失败一次后的时间；30 分钟内暂停请求 |
+| `second_failure_at` | 冷却后再全部失败则永久停用；**把两个时间改回 `null` 才恢复** |
+| `context_tokens` | **总上下文**，默认 256000；输入与输出共享 |
+| `input_tokens` / `reply_tokens` | 最大输入 / 输出：256000 / 128000（并非可以同时用满） |
+| `max_payload_bytes` | HTTP 请求大小上限，默认 512000 字节 |
+| `timeout_seconds` | **每个模型**超时，默认 300 秒（深度思考可单独设 600） |
+| `min_lines` | Hook 自动拦截完整文件读取的阈值，默认 350 行 |
 
-**总上下文只有 256000：输入与输出预留之和不能超过总窗口。** 默认长回复预留 128000 时，单次请求的有效输入最多约 128000（按保守字节估算）；分片摘要只预留 512 输出，因此可使用更大的输入片段。
+每个模型还可单独设置 `context_tokens`、`input_tokens`、`reply_tokens`、`timeout_seconds`，以及可选的 `reasoning_effort`（如 `low`、`medium`、`high`）和 `token_field`（`max_tokens` 或 `max_completion_tokens`，按厂家要求选择）。**不支持的思考参数不要填写。** 分片按所有模型中最小的有效上下文预算计算。
 
-仅 `api_base` 和 `model` 必填；其余参数省略时使用默认值。请填支持 256k 总上下文的模型，否则调低配置。
-
-保存后执行：
+保存配置后：
 
 ```bash
 chmod 600 ~/.codex/shunt/config.json
 ```
 
-使用 **Ollama**：把 `api_base` 改为 `http://127.0.0.1:11434/v1`、`model` 改为已安装的模型名，`api_key` 设为 `""`。只需配置 JSON，不用 `export`。
+本地 **Ollama** 将 `api_base` 设为 `http://127.0.0.1:11434/v1`、`api_key` 设为 `""`。不使用 `export` 环境变量。
 
 ### 3. 使用
 
-在 Codex 中直接说：
+在 Codex 里说“用 `shunt-bulk-reader` 分析大文件”或“用 `shunt-code-writer` 参考已有测试生成新测试”。
 
-- “使用 `shunt-bulk-reader` 分析 `src/app.py`。”
-- “使用 `shunt-code-writer` 参考现有测试生成新测试。”
+**注意：** 冷却或停用时 Hook 会放行 Codex 自己读取文件；不会后台重试。远程 Worker 会收到选中的源文件，切勿委托密钥或敏感内容。超时切换可能重复计费；摘要可能漏掉跨分片细节。生成代码不会覆盖已有文件。
 
-**注意：** 大文件会自动分片，但摘要可能遗漏细节；Hook 不会拦截所有文件读取方式。远程 Worker 会收到被委托的源代码，**不要发送密钥或敏感文件**。生成代码不会覆盖已有目标文件。
-
-运行测试：`python3 -m unittest discover -s tests -v`（开发者克隆仓库后使用）。
+测试（开发者克隆仓库后）：`python3 -m unittest discover -s tests -v`。
 
 ## English
 
-Delegate large source reads and boilerplate generation to an inexpensive OpenAI-compatible AI worker, including Ollama. Requires **Codex CLI** and **Python 3.9+**.
+Codex plugin for low-cost AI workers, with ordered multi-provider fallback and Ollama support. Requires Codex CLI and Python 3.9+.
 
-**Install directly from GitHub (no manual clone):**
+**Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task.
 
-```bash
-codex plugin marketplace add lance-donif/codex-shunt
-codex
-```
+**Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. Set model-specific reasoning parameters and context limits if your provider supports them. On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
 
-Run `/plugins`, install **Codex Shunt**, and start a new task.
-
-**Configure:** Create `~/.codex/shunt/config.json` with the nine options above: API address/model/key, context/input/output token limits, request size, timeout, and Hook threshold. The 256k total context is shared: a 128k maximum output leaves at most about 128k input for full-length replies. Only `api_base` and `model` are required; others have defaults. On macOS/Linux, keep the directory private and `chmod 600` the file. Environment variables are not supported.
-
-**Use:** Ask Codex to use `shunt-bulk-reader` or `shunt-code-writer`. Remote workers receive selected source files; avoid secrets. Chunk summaries may miss details, and Hooks do not intercept every read.
+**Safety:** Remote providers receive selected source files. Fallback after timeouts may cause duplicate charges; chunk summaries may omit details. Hooks do not intercept every read.
 
 ---
 
