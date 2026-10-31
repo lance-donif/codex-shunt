@@ -77,6 +77,10 @@ def model_number(model, name, default, parse=int):
         raise ShuntError(f"{model['name']}: {name} must be a positive number") from exc
 
 
+def chunk_summary_limit():
+    return positive_number("chunk_summary_tokens", 8192, int)
+
+
 def output_limit(model, max_tokens=None):
     maximum = model_number(model, "reply_tokens", 128000)
     return min(max_tokens, maximum) if max_tokens is not None else maximum
@@ -144,7 +148,10 @@ def call_model(model, mode, message, max_tokens=None):
                 req, timeout=model_number(model, "timeout_seconds", 300, float)) as result:
             data = json.load(result)
     except urllib.error.HTTPError as exc:
-        raise WorkerFailure(f"HTTP {exc.code}") from exc
+        if exc.code in (408, 429) or 500 <= exc.code <= 599:
+            raise WorkerFailure(f"HTTP {exc.code}") from exc
+        # Invalid requests, missing credentials and redirects must not trip failover.
+        raise ShuntError(f"{model['name']}: worker HTTP {exc.code} (check API parameters or credentials)") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise WorkerFailure(f"connection failed: {exc}") from exc
     except (ValueError, UnicodeError) as exc:
@@ -203,23 +210,34 @@ def file_message(path, start, content, question):
 def file_chunks(path, content, question, budget):
     """Preserve every character; split at lines unless a single line is oversized."""
     pending = ""
+    used = 0
     start = 1
+    summary_tokens = chunk_summary_limit()
+
+    def overhead():
+        return len(payload_bytes("bulk-reader", file_message(path, start, "", question), summary_tokens))
+
+    base = overhead()
     for line_number, original_line in enumerate(content.splitlines(keepends=True) or [""], 1):
         line = original_line
         while line:
-            candidate = pending + line
-            if len(payload_bytes("bulk-reader", file_message(path, start, candidate, question), 512)) <= budget:
-                pending = candidate
+            # JSON string escaping is additive, so avoid re-serializing the growing chunk.
+            added = len(json.dumps(line, ensure_ascii=False).encode("utf-8")) - 2
+            if base + used + added <= budget:
+                pending += line
+                used += added
                 break
             if pending:
                 yield file_message(path, start, pending, question)
                 pending = ""
+                used = 0
                 start = line_number
+                base = overhead()
                 continue
             low, high, best = 1, len(line), 0
             while low <= high:
                 mid = (low + high) // 2
-                if len(payload_bytes("bulk-reader", file_message(path, start, line[:mid], question), 512)) <= budget:
+                if len(payload_bytes("bulk-reader", file_message(path, start, line[:mid], question), summary_tokens)) <= budget:
                     best = mid
                     low = mid + 1
                 else:
@@ -228,13 +246,14 @@ def file_chunks(path, content, question, budget):
                 raise ShuntError("worker input budget is too small for file metadata and question")
             yield file_message(path, start, line[:best], question)
             line = line[best:]
-            if not line:
-                break
+            start = line_number
+            base = overhead()
         if not pending:
             start = line_number + 1
+            base = overhead()
     if pending or not content:
         message = file_message(path, start, pending, question)
-        if len(payload_bytes("bulk-reader", message, 512)) > budget:
+        if len(payload_bytes("bulk-reader", message, summary_tokens)) > budget:
             raise ShuntError("worker input budget is too small for file metadata and question")
         yield message
 
@@ -252,12 +271,12 @@ def reduce_summaries(question, summaries, budget):
         batch = []
         for summary in summaries:
             candidate = "\n\n".join(batch + [summary])
-            if len(payload_bytes("bulk-reader", prefix + candidate, 512)) > request_budget(512):
+            if len(payload_bytes("bulk-reader", prefix + candidate, chunk_summary_limit())) > request_budget(chunk_summary_limit()):
                 if not batch:
                     raise ShuntError("worker summary is too large to reduce; increase context_tokens")
                 batches.append(batch)
                 batch = [summary]
-                if len(payload_bytes("bulk-reader", prefix + summary, 512)) > request_budget(512):
+                if len(payload_bytes("bulk-reader", prefix + summary, chunk_summary_limit())) > request_budget(chunk_summary_limit()):
                     raise ShuntError("worker summary is too large to reduce; increase context_tokens")
             else:
                 batch.append(summary)
@@ -265,7 +284,7 @@ def reduce_summaries(question, summaries, budget):
             batches.append(batch)
         if len(batches) >= len(summaries):
             raise ShuntError("worker summaries cannot fit together; increase context_tokens")
-        summaries = [worker_request("bulk-reader", prefix + "\n\n".join(batch), max_tokens=512)
+        summaries = [worker_request("bulk-reader", prefix + "\n\n".join(batch), max_tokens=chunk_summary_limit())
                      for batch in batches]
 
 
@@ -279,9 +298,9 @@ def bulk_read(args):
         print(worker_request("bulk-reader", message))
         return
     chunks = [chunk for path, content in documents
-              for chunk in file_chunks(path, content, args.question, request_budget(512))]
+              for chunk in file_chunks(path, content, args.question, request_budget(chunk_summary_limit()))]
     summaries = [f"Chunk {i + 1}/{len(chunks)}:\n" +
-                 worker_request("bulk-reader", chunk, max_tokens=512)
+                 worker_request("bulk-reader", chunk, max_tokens=chunk_summary_limit())
                  for i, chunk in enumerate(chunks)]
     print(reduce_summaries(args.question, summaries, budget))
 

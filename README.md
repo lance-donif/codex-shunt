@@ -40,6 +40,7 @@ chmod 700 ~/.codex/shunt
   "input_tokens": 256000,
   "reply_tokens": 128000,
   "max_payload_bytes": 512000,
+  "chunk_summary_tokens": 8192,
   "timeout_seconds": 300,
   "min_lines": 350
 }
@@ -55,10 +56,11 @@ chmod 700 ~/.codex/shunt
 | `context_tokens` | **总上下文**，默认 256000；输入与输出共享 |
 | `input_tokens` / `reply_tokens` | 最大输入 / 输出：256000 / 128000（并非可以同时用满） |
 | `max_payload_bytes` | HTTP 请求大小上限，默认 512000 字节 |
+| `chunk_summary_tokens` | 每个分片及中间汇总的最大输出，默认 **8192**，仍受模型 `reply_tokens` 和上下文限制 |
 | `timeout_seconds` | **每个模型**超时，默认 300 秒（深度思考可单独设 600） |
 | `min_lines` | Hook 自动拦截完整文件读取的阈值，默认 350 行 |
 
-每个模型还可单独设置 `context_tokens`、`input_tokens`、`reply_tokens`、`timeout_seconds`，以及可选的 `reasoning_effort`（如 `low`、`medium`、`high`）和 `token_field`（`max_tokens` 或 `max_completion_tokens`，按厂家要求选择）。**不支持的思考参数不要填写。** 分片按所有模型中最小的有效上下文预算计算。
+每个模型还可单独设置 `context_tokens`、`input_tokens`、`reply_tokens`、`timeout_seconds`，以及可选的 `reasoning_effort`（如 `low`、`medium`、`high`）和 `token_field`（`max_tokens` 或 `max_completion_tokens`，按厂家要求选择）。**不支持的思考参数不要填写。** 分片按所有模型中最小的有效上下文预算计算；深度思考模型可以调大 `chunk_summary_tokens`，但会增加调用成本。
 
 保存配置后：
 
@@ -71,6 +73,13 @@ chmod 600 ~/.codex/shunt/config.json
 ### 3. 使用
 
 在 Codex 里说“用 `shunt-bulk-reader` 分析大文件”或“用 `shunt-code-writer` 参考已有测试生成新测试”。
+也能直接调用脚本（在源码目录运行）：
+
+```bash
+python3 plugins/shunt/scripts/shunt.py bulk-read --question "这个模块做什么？" --paths src/app.py
+python3 plugins/shunt/scripts/shunt.py code-write --spec "生成单元测试" --reference tests/existing.py --target tests/new.py
+```
+
 
 **注意：** 冷却或停用时 Hook 会放行 Codex 自己读取文件；不会后台重试。远程 Worker 会收到选中的源文件，切勿委托密钥或敏感内容。超时切换可能重复计费；摘要可能漏掉跨分片细节。生成代码不会覆盖已有文件。
 
@@ -80,9 +89,9 @@ chmod 600 ~/.codex/shunt/config.json
 
 Codex plugin for low-cost AI workers, with ordered multi-provider fallback and Ollama support. Requires Codex CLI and Python 3.9+.
 
-**Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task.
+**Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task. Two standalone Python CLI commands (`bulk-read`, `code-write`) are also available in `plugins/shunt/scripts/shunt.py`.
 
-**Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. Set model-specific reasoning parameters and context limits if your provider supports them. On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
+**Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. Set model-specific reasoning parameters and context limits if your provider supports them. `chunk_summary_tokens` defaults to **8192** (capped by each model’s reply budget). On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
 
 **Safety:** Remote providers receive selected source files. Fallback after timeouts may cause duplicate charges; chunk summaries may omit details. Hooks do not intercept every read.
 

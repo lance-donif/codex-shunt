@@ -17,7 +17,7 @@ CONFIG_PATH = Path.home() / ".codex" / "shunt" / "config.json"
 FIELDS = {
     "api_base": str, "model": str, "api_key": str,
     "context_tokens": int, "input_tokens": int, "reply_tokens": int,
-    "max_payload_bytes": int, "timeout_seconds": (int, float), "min_lines": int,
+    "max_payload_bytes": int, "chunk_summary_tokens": int, "timeout_seconds": (int, float), "min_lines": int,
     "models": list, "current_model": int,
     "first_failure_at": (str, type(None)), "second_failure_at": (str, type(None)),
 }

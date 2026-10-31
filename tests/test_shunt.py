@@ -260,7 +260,7 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         bodies = [body for _, body, _ in FakeHandler.requests]
         self.assertGreater(len(bodies), 1)
-        self.assertEqual(bodies[0]["max_tokens"], 512)  # chunk output, not 128k
+        self.assertEqual(bodies[0]["max_tokens"], 8192)  # chunk output, not 128k
         self.assertEqual(bodies[-1]["max_tokens"], 128000)
         for body in bodies:
             size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
@@ -276,6 +276,34 @@ class ShuntTests(unittest.TestCase):
         self.assertGreater(len(FakeHandler.requests), 5)
         for _, body, _ in FakeHandler.requests:
             self.assertLessEqual(len(json.dumps(body, ensure_ascii=False).encode()), 1024)
+
+    def test_chunk_summary_output_is_configurable_and_respects_model_reply_cap(self):
+        self.update_config(chunk_summary_tokens=8192, max_payload_bytes=2500)
+        self.src.write_text("line\n" * 600)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        bodies = [body for _, body, _ in FakeHandler.requests]
+        self.assertGreater(len(bodies), 1)
+        self.assertEqual(bodies[0]["max_tokens"], 8192)
+        self.assertEqual(bodies[-1]["max_tokens"], 128000)
+        FakeHandler.requests.clear()
+        self.update_config(chunk_summary_tokens=1024)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(FakeHandler.requests[0][1]["max_tokens"], 1024)
+        FakeHandler.requests.clear()
+        self.update_config(chunk_summary_tokens=8192, reply_tokens=4096)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(FakeHandler.requests[0][1]["max_tokens"], 4096)
+
+    def test_rejects_invalid_chunk_summary_limit_without_network(self):
+        self.update_config(chunk_summary_tokens=0, max_payload_bytes=2500)
+        self.src.write_text("line\n" * 600)
+        p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("chunk_summary_tokens", p.stderr)
+        self.assertFalse(FakeHandler.requests)
 
     def test_unreadable_input_is_error_not_fake_context(self):
         p = self.run_cli("bulk-read", "--question", "hi", "--paths", "missing.py")
@@ -477,6 +505,34 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(self.config_state()["current_model"], 0)
         self.assertIsNone(self.config_state()["first_failure_at"])
 
+    def test_permanent_http_errors_do_not_failover_or_change_state(self):
+        for status in (301, 400, 401, 402, 403, 404, 422):
+            with self.subTest(status=status):
+                self.multi_config()
+                FakeHandler.status = status
+                FakeHandler.requests.clear()
+                p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn(f"HTTP {status}", p.stderr)
+                self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A"])
+                state = self.config_state()
+                self.assertEqual(state["current_model"], 0)
+                self.assertIsNone(state["first_failure_at"])
+                self.assertIsNone(state["second_failure_at"])
+        FakeHandler.status = 200
+
+    def test_transient_http_errors_trigger_failover(self):
+        for status in (408, 429, 500, 503):
+            with self.subTest(status=status):
+                self.multi_config()
+                FakeHandler.requests.clear()
+                FakeHandler.provider_status = {"A": status}
+                p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual([b["model"] for _, b, _ in FakeHandler.requests], ["A", "B"])
+                self.assertEqual(self.config_state()["current_model"], 1)
+        FakeHandler.provider_status = {}
+
     def test_first_full_failure_cools_for_thirty_minutes_and_second_disables(self):
         self.multi_config()
         FakeHandler.status = 503
@@ -514,7 +570,7 @@ class ShuntTests(unittest.TestCase):
 
     def test_success_after_cooldown_resets_failure_history(self):
         self.multi_config(first_failure_at=(datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat())
-        FakeHandler.provider_status = {"A": 401}
+        FakeHandler.provider_status = {"A": 503}
         p = self.run_cli("bulk-read", "--question", "hi", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         state = self.config_state()
