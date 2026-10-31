@@ -639,12 +639,17 @@ class ShuntTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual((self.cwd / ".codex/shunt/config.json").stat().st_mode & 0o777, 0o600)
 
-    def test_portable_manifest_and_skills(self):
+    def test_codex_legacy_manifest_loads_hooks_and_skills(self):
         plugin = ROOT / "plugins/shunt"
-        doc = json.loads((plugin / "plugin.json").read_text())
+        self.assertFalse((plugin / "plugin.json").exists())  # Root Agent Plugins manifest suppresses hooks on affected Codex versions.
+        doc = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
         self.assertEqual(marketplace["plugins"][0]["source"]["path"], "./plugins/shunt")
-        self.assertEqual(doc["extensions"]["com.openai"]["hooks"], "./hooks/hooks.json")
+        self.assertEqual(doc["hooks"], "./hooks/hooks.json")
+        self.assertEqual(doc["name"], "shunt")
+        self.assertEqual(doc["interface"]["displayName"], "Codex Shunt")
+        hook = json.loads((plugin / doc["hooks"]).read_text())
+        self.assertEqual(hook["hooks"]["PreToolUse"][0]["matcher"], "^Bash$")
         self.assertTrue((plugin / "hooks/hooks.json").exists())
         for name in ("bulk-reader", "code-writer"):
             content = (plugin / "skills" / name / "SKILL.md").read_text()

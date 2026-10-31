@@ -14,6 +14,16 @@ codex
 ```
 
 在 Codex 里输入 `/plugins`，安装 **Codex Shunt**，然后开启新任务。
+ 
+**安装后在 `/hooks` 审查并信任 Shunt 的 `PreToolUse` Hook**，否则它不会执行。之前安装过旧版的，请刷新并重装一次（不会删除 `~/.codex/shunt/config.json`）：
+
+```bash
+codex plugin marketplace upgrade codex-shunt-local
+codex plugin remove shunt@codex-shunt-local
+codex plugin add shunt@codex-shunt-local
+```
+
+升级后重新启动 Codex，并在 `/hooks` 检查。旧版根目录 `plugin.json` 会触发 [Codex 已知的 Hook 加载问题](https://github.com/openai/codex/issues/47925)；现在改用 `.codex-plugin/plugin.json` 兼容格式.
 
 ### 2. 配置
 
@@ -89,7 +99,7 @@ python3 plugins/shunt/scripts/shunt.py code-write --spec "生成单元测试" --
 
 Codex plugin for low-cost AI workers, with ordered multi-provider fallback and Ollama support. Requires Codex CLI and Python 3.9+.
 
-**Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task. Two standalone Python CLI commands (`bulk-read`, `code-write`) are also available in `plugins/shunt/scripts/shunt.py`.
+**Install:** `codex plugin marketplace add lance-donif/codex-shunt`, then install **Codex Shunt** via `/plugins` and start a new task. Review and trust `PreToolUse` in `/hooks`. If upgrading from an older version, run `codex plugin marketplace upgrade codex-shunt-local`, remove `shunt@codex-shunt-local`, and install it again. Two standalone Python CLI commands (`bulk-read`, `code-write`) are also available in `plugins/shunt/scripts/shunt.py`.
 
 **Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. Set model-specific reasoning parameters and context limits if your provider supports them. `chunk_summary_tokens` defaults to **8192** (capped by each model’s reply budget). On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
 
