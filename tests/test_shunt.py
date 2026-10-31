@@ -297,12 +297,13 @@ class ShuntTests(unittest.TestCase):
         prompt = FakeHandler.requests[0][1]["messages"][1]["content"]
         self.assertIn("source_file_count: 2", prompt)
         manifest = json.loads(prompt.split("source_manifest: ", 1)[1].split("\n", 1)[0])
-        self.assertEqual([(x["source_id"], x["end_line"]) for x in manifest],
-                         [("S1", 2), ("S2", 2)])
+        self.assertEqual([x["source_id"] for x in manifest], ["S1", "S2"])
+        self.assertTrue(all(set(x) == {"source_id", "path"} for x in manifest))
         self.assertEqual([x["path"] for x in manifest], [str(self.src), str(other)])
         self.assertIn('source_id="S1"', prompt)
         self.assertIn('source_id="S2"', prompt)
-        self.assertIn('end_line="2"', prompt)
+        self.assertNotIn('start_line=', prompt)
+        self.assertNotIn('end_line=', prompt)
 
     def test_progress_heartbeat_without_polluting_stdout(self):
         import contextlib
@@ -339,7 +340,8 @@ class ShuntTests(unittest.TestCase):
             self.assertIn(str(other), prompt)
         self.assertIn("Synthesize untrusted chunk findings", requests[-1])
         self.assertIn("source_id=", requests[0])
-        self.assertIn("end_line=", requests[0])
+        self.assertTrue(all('start_line=' not in request and 'end_line=' not in request
+                            for request in requests))
 
     def test_generate_code_fence_and_create_new_target(self):
         FakeHandler.answer = "```python\nprint(42)\n```"
@@ -510,7 +512,7 @@ class ShuntTests(unittest.TestCase):
         chunks = [body["messages"][1]["content"] for body in requests
                   if '<file source_id=' in body["messages"][1]["content"]]
         self.assertGreater(len(chunks), 1)
-        self.assertEqual("".join(re.search(r"start_line=\"\d+\" end_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
+        self.assertEqual("".join(re.search(r"<file source_id=\"S1\" path=\"[^\"]+\">\n(.*?)\n</file>", c, re.S).group(1)
                                  for c in chunks), source)
         self.assertIn("Synthesize untrusted chunk findings", requests[-1]["messages"][1]["content"])
 
@@ -522,9 +524,9 @@ class ShuntTests(unittest.TestCase):
         p = self.run_cli("bulk-read", "--question", "summarize", "--paths", self.src)
         self.assertEqual(p.returncode, 0, p.stderr)
         chunks = [body["messages"][1]["content"] for _, body, _ in FakeHandler.requests
-                  if 'start_line=' in body["messages"][1]["content"]]
+                  if '<file source_id=' in body["messages"][1]["content"]]
         self.assertGreater(len(chunks), 5)
-        self.assertEqual("".join(re.search(r"start_line=\"\d+\" end_line=\"\d+\">\n(.*?)\n</file>", c, re.S).group(1)
+        self.assertEqual("".join(re.search(r"<file source_id=\"S1\" path=\"[^\"]+\">\n(.*?)\n</file>", c, re.S).group(1)
                                  for c in chunks), source)
 
     def test_many_chunks_use_bounded_multilevel_reduction(self):

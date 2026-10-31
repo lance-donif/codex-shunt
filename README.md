@@ -95,7 +95,7 @@ python3 plugins/shunt/scripts/shunt.py code-write --spec "生成单元测试" --
 ```
 
 
-**进度：** CLI 会向 `stderr` 报告文件数、分片序号、模型请求与耗时；请求等待期间每 10 秒发送心跳，不污染 `stdout`。完整读取、分片和汇总请求均携带由插件生成的 `source_file_count`、路径、`source_id` 和原文件行号范围，**模型给出的具体行号仍需 Codex 定点核对**。不使用 SSE 流式输出。
+**进度：** CLI 会向 `stderr` 报告文件数、分片序号、模型请求与耗时；请求等待期间每 10 秒发送心跳，不污染 `stdout`。完整读取、分片和汇总请求均携带由插件生成的 `source_file_count`、路径、`source_id`，不再添加容易误导的行号标记；需要精确位置时由 Codex 读取原文件定位。不使用 SSE 流式输出。
 
 **注意：** Windows 上 CLI 的标准输出和错误输出强制使用 UTF-8；Worker HTTP 响应按 `Content-Type` 字符集（未声明时 UTF-8）解码。全部模型并发满额时，不等待、不排队，Codex 应直接完成任务。请求占用的是跨进程系统文件锁，进程退出自动释放。冷却或停用时 Hook 会放行 Codex 自己读取文件；不会后台重试。远程 Worker 会收到选中的源文件，切勿委托密钥或敏感内容。超时切换可能重复计费；摘要可能漏掉跨分片细节。生成代码不会覆盖已有文件。
 
@@ -111,7 +111,7 @@ Codex plugin for low-cost AI workers, with ordered multi-provider fallback and O
 
 **Configure:** Create `~/.codex/shunt/config.json` using [config.example.json](config.example.json). Models cycle A → B → C on failure; success keeps the pointer. A complete failure pauses calls for 30 minutes. Another complete failure after cooldown disables Worker calls until **both** failure timestamps are manually set to `null`. Timeout defaults to 300 seconds per model. `max_concurrency` defaults to 5 requests per provider; when all are busy Codex should handle the task itself without marking providers failed. Set model-specific reasoning parameters and context limits if your provider supports them. `chunk_summary_tokens` defaults to **8192** (capped by each model’s reply budget). On Unix, protect the directory (`700`) and file (`600`). No environment variables are used.
 
-**Progress:** stderr reports file counts, chunk stages, provider timings and a 10-second heartbeat during requests; stdout stays answer-only. Requests retain a source manifest and source ranges, but model-supplied line citations still need independent verification. No SSE dependency.
+**Progress:** stderr reports file counts, chunk stages, provider timings and a 10-second heartbeat during requests; stdout stays answer-only. Requests retain a source manifest with source IDs and paths, without generated line-number markers. Codex must locate exact code in the original files. No SSE dependency.
 
 **Windows:** CLI stdout/stderr use UTF-8 regardless of console codepage; HTTP JSON decoding honors response charset or defaults to UTF-8.
 
