@@ -23,6 +23,7 @@ spec.loader.exec_module(HOOK_MODULE)
 
 class FakeHandler(BaseHTTPRequestHandler):
     requests = []
+    user_agents = []
     answer = "output"
     status = 200
     redirect = None
@@ -32,6 +33,7 @@ class FakeHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         request = json.loads(body)
         self.__class__.requests.append((self.path, request, self.headers.get("Authorization")))
+        self.__class__.user_agents.append(self.headers.get("User-Agent"))
         if self.__class__.redirect:
             self.send_response(307)
             self.send_header("Location", self.__class__.redirect)
@@ -69,12 +71,14 @@ class ShuntTests(unittest.TestCase):
         self.src = self.cwd / "source.py"
         self.src.write_text("def hello():\n    return 3\n", encoding="utf-8")
         FakeHandler.requests = []
+        FakeHandler.user_agents = []
         FakeHandler.answer = "output"
         FakeHandler.status = 200
         FakeHandler.redirect = None
         FakeHandler.provider_status = {}
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("SHUNT_")}
         self.env["HOME"] = str(self.cwd)
+        self.env["USERPROFILE"] = str(self.cwd)
         self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
                            "model": "cheap-mock", "api_key": "test-only-key"})
 
@@ -110,11 +114,13 @@ class ShuntTests(unittest.TestCase):
         self.write_config({"api_base": f"http://127.0.0.1:{self.server.server_port}/v1",
                            "model": "configured-cheap", "api_key": "config-test-key",
                            "context_tokens": 3000, "reply_tokens": 500})
-        env = self.env
+        env = dict(self.env, CODEX_INTERNAL_ORIGINATOR_OVERRIDE="Codex Desktop",
+                   CODEX_VERSION="0.0.0-test")
         p = self.run_cli("bulk-read", "--question", "Describe", "--paths", self.src, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(FakeHandler.requests[0][1]["model"], "configured-cheap")
         self.assertEqual(FakeHandler.requests[0][2], "Bearer config-test-key")
+        self.assertTrue(FakeHandler.user_agents[0].startswith("Codex Desktop/0.0.0-test ("))
         target = self.cwd / "generated.py"
         p = self.run_cli("code-write", "--spec", "Make test", "--reference", self.src,
                          "--target", target, env=env)
