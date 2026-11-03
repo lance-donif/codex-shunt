@@ -53,6 +53,34 @@ def read_paths(argv, limit):
         return []
     cmd = Path(argv[0]).name
     args = argv[1:]
+    if cmd.lower() in ("powershell", "pwsh"):
+        if len(args) != 2 or args[0].lower() not in ("-command", "-c"):
+            return []
+        try:
+            argv = shlex.split(args[1])
+        except ValueError:
+            return []
+        return read_paths(argv, limit)
+    if cmd.lower() in ("get-content", "gc", "type"):
+        if any(arg in ("|", ";", "&", "<", ">", "`") for arg in args):
+            return []
+        paths = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg.lower() in ("-literalpath", "-path") and i + 1 < len(args):
+                paths.append(args[i + 1])
+                i += 2
+            elif arg.lower() in ("-raw", "-readcount", "-totalcount"):
+                if arg.lower() != "-raw":
+                    return []
+                i += 1
+            elif arg.startswith("-"):
+                return []
+            else:
+                paths.append(arg)
+                i += 1
+        return paths if len(paths) == 1 else []
     if cmd in ("python", "python3"):
         return python_read(argv)
     if cmd in ("cat", "nl", "less", "more"):

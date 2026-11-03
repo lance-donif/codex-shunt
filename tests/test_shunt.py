@@ -634,6 +634,17 @@ class ShuntTests(unittest.TestCase):
                          ["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.hook("cat big.py && echo side-effect"), {})
 
+    def test_hook_blocks_powershell_full_file_reads(self):
+        self.src.write_text("代码\n" * 400, encoding="utf-8")
+        for command in (
+            f'Get-Content -LiteralPath "{self.src}"',
+            f'gc "{self.src}"',
+            f'pwsh -Command "Get-Content -LiteralPath \'{self.src}\'"',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.hook(command)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.hook(f'Get-Content "{self.src}" | Select-Object -First 10'), {})
+
     def multi_config(self, **extras):
         base = f"http://127.0.0.1:{self.server.server_port}/v1"
         data = {
@@ -898,7 +909,7 @@ class ShuntTests(unittest.TestCase):
         self.assertEqual(doc["name"], "shunt")
         self.assertEqual(doc["interface"]["displayName"], "Codex Shunt")
         hook = json.loads((plugin / doc["hooks"]).read_text())
-        self.assertEqual(hook["hooks"]["PreToolUse"][0]["matcher"], "^Bash$")
+        self.assertEqual(hook["hooks"]["PreToolUse"][0]["matcher"], "^(Bash|PowerShell|pwsh)$")
         self.assertTrue((plugin / "hooks/hooks.json").exists())
         for name in ("bulk-reader", "code-writer"):
             content = (plugin / "skills" / name / "SKILL.md").read_text()
